@@ -214,7 +214,7 @@ jobs:
         run: |
           mkdir -p /tmp/digest
           printf '%s' "${{ steps.build.outputs.digest }}" > /tmp/digest/${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: candidate-digest-wolfi-${{ matrix.arch }}
           path: /tmp/digest/${{ matrix.arch }}
@@ -235,7 +235,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: candidate-digest-wolfi-${{ matrix.build_arch }}
           path: /tmp/digest
@@ -265,7 +265,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: candidate-digest-wolfi-*
           path: /tmp/digest

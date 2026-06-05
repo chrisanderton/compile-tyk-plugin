@@ -47,12 +47,25 @@ ok "architecture: $machine"
 if command -v go >/dev/null; then
   buildinfo="$(go version -m "$SO" 2>/dev/null)"
   plugin_go="$(echo "$buildinfo" | head -1 | awk '{print $2}')"
+  # Only accept a real toolchain string (goX.Y[.Z]). Older Go does not expose the
+  # toolchain for a -buildmode=plugin .so via `go version -m`, leaving this blank.
+  case "$plugin_go" in go1.*) : ;; *) plugin_go="" ;; esac
+  image_go="$(go version 2>/dev/null | awk '{print $3}')"
   if [ -n "${GATEWAY_GO_VERSION:-}" ]; then
-    [ "$plugin_go" = "$GATEWAY_GO_VERSION" ] || \
-      fail "Go toolchain mismatch: plugin=$plugin_go, gateway=$GATEWAY_GO_VERSION. Go plugins MUST be built with the gateway's exact Go version."
-    ok "go toolchain: $plugin_go (matches gateway)"
+    if [ -n "$plugin_go" ]; then
+      [ "$plugin_go" = "$GATEWAY_GO_VERSION" ] || \
+        fail "Go toolchain mismatch: plugin=$plugin_go, gateway=$GATEWAY_GO_VERSION. Go plugins MUST be built with the gateway's exact Go version."
+      ok "go toolchain: $plugin_go (matches gateway)"
+    elif [ "$image_go" = "$GATEWAY_GO_VERSION" ]; then
+      # Build-info unreadable (older Go .so). The plugin was produced by THIS image,
+      # whose Go IS the gateway's Go - so the toolchain matches by construction, and
+      # the subsequent `tyk plugin load` is the definitive ABI check.
+      ok "go toolchain: build-info unreadable (older Go .so); built by image Go $image_go == gateway"
+    else
+      fail "Go toolchain mismatch: plugin build-info unreadable AND image Go=$image_go != gateway=$GATEWAY_GO_VERSION."
+    fi
   else
-    ok "go toolchain: $plugin_go"
+    ok "go toolchain: ${plugin_go:-unreadable (older Go .so)}"
   fi
   # buildmode must be plugin
   echo "$buildinfo" | grep -q -- "-buildmode=plugin" || echo "  ! warning: -buildmode=plugin not recorded in build info"
