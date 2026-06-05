@@ -170,10 +170,13 @@ jobs:
               echo "{\"edition\":\"$1\",\"arch\":\"$a\",\"gateway\":\"$2:$TAG\",\"runner\":\"$runner\",\"build_arch\":\"$build\",\"qemu\":$qemu}"
             done
           }
+          # if/then (not `[ ] && entries`): a false edition check must NOT leave the block
+          # with a non-zero exit, or pipefail+set -e fails the step for CE-only releases
+          # (no EE/FIPS - e.g. v5.0.x, and the v5.3 LTS: EE starts 5.7, FIPS starts 5.8).
           {
             entries ce "$CE_REPO" "${{ steps.r.outputs.CE_ARCHS }}"
-            [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ]   && entries ee "$EE_REPO" "${{ steps.r.outputs.EE_ARCHS }}"
-            [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ] && entries ee-fips "$FIPS_REPO" "${{ steps.r.outputs.FIPS_ARCHS }}"
+            if [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ];   then entries ee "$EE_REPO" "${{ steps.r.outputs.EE_ARCHS }}"; fi
+            if [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ]; then entries ee-fips "$FIPS_REPO" "${{ steps.r.outputs.FIPS_ARCHS }}"; fi
           } | jq -sc . | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
 
   # ---- 2. Stable base, pinned to the current DHI digest (registry-cached) ---

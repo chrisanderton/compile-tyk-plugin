@@ -90,10 +90,12 @@ jobs:
               echo "{\"edition\":\"$1\",\"arch\":\"$a\",\"gateway\":\"$2:$TAG\",\"runner\":\"$runner\"}"
             done
           }
+          # if/then (not `[ ] && entries`): a false edition check must not leave the block
+          # non-zero, or pipefail+set -e fails the step for CE-only releases (no EE/FIPS).
           {
             entries ce tykio/tyk-gateway "${{ steps.n.outputs.ce }}"
-            [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ]   && entries ee tykio/tyk-gateway-ee "${{ steps.n.outputs.ee }}"
-            [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ] && entries ee-fips tykio/tyk-gateway-fips "${{ steps.n.outputs.fips }}"
+            if [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ];   then entries ee tykio/tyk-gateway-ee "${{ steps.n.outputs.ee }}"; fi
+            if [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ]; then entries ee-fips tykio/tyk-gateway-fips "${{ steps.n.outputs.fips }}"; fi
           } | jq -sc . | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
       - id: wd
         run: echo "digest=$(crane digest ${WOLFI_BASE})" >> "$GITHUB_OUTPUT"
