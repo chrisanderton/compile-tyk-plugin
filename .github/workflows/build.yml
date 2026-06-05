@@ -128,6 +128,10 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "stable"
+          # Only used for `go version -m` in resolve-gateway.sh; no modules are
+          # downloaded on the runner (that happens inside Dockerfile.release), so the
+          # default module cache is pointless and warns about a missing go/pkg/mod.
+          cache: false
       - id: r
         env:
           GATEWAY_REPO: ${{ inputs.gateway_image_repo }}

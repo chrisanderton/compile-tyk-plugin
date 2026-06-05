@@ -65,6 +65,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "stable"
+          # resolve-gateway.sh only needs `go version -m`; no runner-side module
+          # downloads, so disable the default cache (avoids the missing go/pkg/mod warning).
+          cache: false
       - id: r
         run: ./scripts/resolve-gateway.sh "${{ inputs.gateway_version }}"
       - id: n
