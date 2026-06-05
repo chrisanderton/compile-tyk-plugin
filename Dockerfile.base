@@ -17,7 +17,10 @@ ARG BASE_IMAGE=dhi.io/debian-base:trixie-debian13-dev
 ############################################################################
 # Stage 1 - glibc-2.31 sysroots (amd64 + arm64 + s390x), from Debian cross pkgs
 ############################################################################
-FROM debian:${SYSROOT_SUITE}-slim AS sysroots
+# Pinned to the native BUILD host: the sysroots are architecture-independent cross
+# files (target-arch libs/headers) COPYed into both arch variants of the final stage,
+# so this must NOT be emulated. Emulated apt/dpkg on bullseye fails (exit 100) under QEMU.
+FROM --platform=$BUILDPLATFORM debian:${SYSROOT_SUITE}-slim AS sysroots
 ARG GLIBC_TARGET
 ARG SYSROOT_SUITE
 RUN set -eux; \

@@ -9,7 +9,8 @@ ARG GLIBC_TARGET=2.31
 ARG BASE_IMAGE=dhi.io/debian-base:trixie-debian13-dev
 
 # ---- Stage 1: glibc-2.31 sysroots (amd64 + arm64 + s390x) ------------------
-FROM debian:${SYSROOT_SUITE}-slim AS sysroots
+# Native build host only (sysroots are arch-independent cross files); never emulate.
+FROM --platform=$BUILDPLATFORM debian:${SYSROOT_SUITE}-slim AS sysroots
 ARG GLIBC_TARGET
 RUN set -eux; apt-get update; \
     apt-get install -y --no-install-recommends \
