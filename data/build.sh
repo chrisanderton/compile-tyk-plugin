@@ -155,19 +155,64 @@ function ensureGoMod {
 
 ensureGoMod
 
-# Create workspace after ensuring go.mod exists (forces identical dep versions
-# to the vendored Gateway source - the core of Go plugin ABI compatibility).
-cd "$WORKSPACE_ROOT"
-go work init ./tyk
-go work use "./$(basename "$PLUGIN_BUILD_PATH")"
-
-cd "$PLUGIN_BUILD_PATH"
-
-if [[ "$GO_GET" == "1" ]] ; then
-	go get "github.com/TykTechnologies/tyk@${GITHUB_SHA}"
+# Match the plugin module's `go` directive to the Gateway's Go version. The pinned
+# toolchain IS the Gateway's Go, and GOTOOLCHAIN=local refuses a go.mod that asks for a
+# newer Go than the toolchain - so a plugin written for a newer line is clamped down to
+# build cleanly, and we can compile for OLD Gateways (e.g. v5.0.x on go1.16) without the
+# caller hand-editing go.mod. (If the plugin SOURCE genuinely uses language features newer
+# than the Gateway's Go, it correctly cannot build - that is inherent to the old target.)
+GW_GO_MM="$(go env GOVERSION 2>/dev/null | sed -E 's/^go([0-9]+\.[0-9]+).*/\1/')"
+if [ -n "$GW_GO_MM" ] && [ -f go.mod ]; then
+	echo "INFO: pinning plugin go directive to Gateway Go ($GW_GO_MM)"
+	go mod edit -go="$GW_GO_MM"
 fi
 
-if [[ "$GO_TIDY" == "1" ]] ; then
+# Force the plugin to build against the EXACT vendored Gateway source + dependency
+# graph - the core of Go plugin ABI compatibility. Two methods, same outcome:
+#   * workspace (default, Go >= 1.18): a go.work makes ./tyk authoritative.
+#   * replace   (Go < 1.18, no workspaces - e.g. building for v5.0.x on go1.16):
+#               point tyk at ./tyk via a replace directive AND mirror the Gateway's
+#               OWN replace directives, so shared transitive deps resolve identically
+#               (replaces apply only to the main module, so the plugin must repeat them).
+# PLUGIN_BUILD_METHOD = auto | workspace | replace  (default auto -> chosen by Go version).
+# The default route is workspace; the replace path exists for legacy ad-hoc builds and
+# will be retired when pre-1.18 Gateways are no longer supported.
+GO_MINOR="$(go env GOVERSION 2>/dev/null | sed -E 's/^go[0-9]+\.([0-9]+).*/\1/')"
+PLUGIN_BUILD_METHOD="${PLUGIN_BUILD_METHOD:-auto}"
+case "$PLUGIN_BUILD_METHOD" in
+	workspace) USE_WS=1 ;;
+	replace)   USE_WS=0 ;;
+	auto)      USE_WS=1; [ "${GO_MINOR:-0}" -ge 18 ] 2>/dev/null || USE_WS=0 ;;
+	*) echo "ERROR: PLUGIN_BUILD_METHOD must be auto|workspace|replace (got '$PLUGIN_BUILD_METHOD')" >&2; exit 1 ;;
+esac
+
+if [ "$USE_WS" = "1" ]; then
+	echo "INFO: dependency-alignment method=workspace (Go 1.${GO_MINOR:-?})"
+	cd "$WORKSPACE_ROOT"
+	go work init ./tyk
+	go work use "./$(basename "$PLUGIN_BUILD_PATH")"
+	cd "$PLUGIN_BUILD_PATH"
+	if [[ "$GO_GET" == "1" ]] ; then
+		go get "github.com/TykTechnologies/tyk@${GITHUB_SHA}"
+	fi
+	if [[ "$GO_TIDY" == "1" ]] ; then
+		go mod tidy
+	fi
+else
+	echo "INFO: dependency-alignment method=replace (Go 1.${GO_MINOR:-?} has no workspaces)"
+	cd "$PLUGIN_BUILD_PATH"
+	# Point the plugin's tyk dependency at the vendored Gateway source.
+	go mod edit -replace "github.com/TykTechnologies/tyk=${TYK_GW_PATH}"
+	grep -q 'TykTechnologies/tyk' go.mod \
+		|| go mod edit -require "github.com/TykTechnologies/tyk@v0.0.0-00010101000000-000000000000"
+	# Mirror the Gateway's own replace directives (local-path replaces are relative to
+	# the Gateway dir, so re-anchor them to its absolute path).
+	go mod edit -json "${TYK_GW_PATH}/go.mod" 2>/dev/null \
+		| jq -r '.Replace[]? | [(.Old.Path + (if .Old.Version then "@"+.Old.Version else "" end)), (.New.Path + (if .New.Version then "@"+.New.Version else "" end))] | @tsv' \
+		| while IFS=$'\t' read -r oldspec newspec; do
+			case "$newspec" in ./*|../*) newspec="${TYK_GW_PATH}/${newspec}" ;; esac
+			go mod edit -replace "${oldspec}=${newspec}"
+		done
 	go mod tidy
 fi
 
