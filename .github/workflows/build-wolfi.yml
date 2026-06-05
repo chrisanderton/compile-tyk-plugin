@@ -123,19 +123,33 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The gate pulls the base BY DIGEST from separate runners, so the base must ALWAYS
+      # be pushed to GHCR even on a push=false dry run (else the digest is empty and the
+      # gate fails with a "-base-wolfi@" reference). Docker Hub mirror is gated by `push`.
+      - id: basetags
+        env:
+          PUSH: ${{ inputs.push }}
+          DH_NS: ${{ needs.resolve.outputs.dh_ns }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi:latest"
+            if [ "$PUSH" = "true" ]; then
+              echo "docker.io/${DH_NS}/${IMAGE_NAME}-base-wolfi:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.base
           platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.push }}
+          push: true
           build-args: |
             BASE_IMAGE=${{ env.WOLFI_BASE }}@${{ needs.resolve.outputs.wolfi_digest }}
             DHI_DIGEST=${{ needs.resolve.outputs.wolfi_digest }}
-          tags: |
-            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:latest
-            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}-base-wolfi:latest
+          tags: ${{ steps.basetags.outputs.tags }}
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache,mode=max
 
@@ -192,6 +206,8 @@ jobs:
 
   publish:
     needs: [resolve, base, gate]
+    # Dry runs (push=false) stop at the gate; skip the multi-arch publish build.
+    if: ${{ inputs.push }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

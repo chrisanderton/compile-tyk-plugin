@@ -204,19 +204,34 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The gate runs on separate runners and pulls the base BY DIGEST, so the base must
+      # ALWAYS be pushed to GHCR (your own namespace) - even on a push=false dry run, or
+      # there is no digest and the gate fails with a "-base@" (empty) reference. Only the
+      # Docker Hub mirror of the base is gated by `push`.
+      - id: basetags
+        env:
+          PUSH: ${{ inputs.push }}
+          DH_NS: ${{ needs.resolve.outputs.dh_ns }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base:latest"
+            if [ "$PUSH" = "true" ]; then
+              echo "docker.io/${DH_NS}/${IMAGE_NAME}-base:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.base
           platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.push }}
+          push: true
           build-args: |
             BASE_IMAGE=${{ env.DHI_BASE }}@${{ needs.resolve.outputs.dhi_digest }}
             DHI_DIGEST=${{ needs.resolve.outputs.dhi_digest }}
-          tags: |
-            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:latest
-            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}-base:latest
+          tags: ${{ steps.basetags.outputs.tags }}
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache,mode=max
 
@@ -282,6 +297,9 @@ jobs:
   # ---- 4. PUBLISH multi-arch -> Docker Hub + GHCR (only if the gate passed) -
   publish:
     needs: [resolve, base, gate]
+    # On a push=false dry run the gate is the whole point; skip the multi-arch publish
+    # build entirely (it would build and discard). Real runs (push=true) publish.
+    if: ${{ inputs.push }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
