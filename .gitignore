@@ -1,0 +1,15 @@
+*.env
+
+# Internal research, evidence, and reference copies (not part of the public deliverable)
+/internal/
+
+# Generated scan/SBOM output (reproduce with `task sbom` / `task scan` / scripts/cve-compare.sh)
+/artifacts/
+
+# Built plugin objects and Go workspace files
+*.so
+go.work
+go.work.sum
+
+# OS / editor cruft
+.DS_Store

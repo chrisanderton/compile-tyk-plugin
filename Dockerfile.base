@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.7
+#
+# tyk-plugin-compiler-BASE - the STABLE layer (slow cadence).
+# Contains everything that does NOT change per Gateway release:
+#   modern hardened base (DHI), C toolchains (native + amd64/arm64/s390x cross),
+#   glibc-2.31 link sysroots, build.sh, validate-plugin.sh, env.
+# It deliberately ships NO Go toolchain and NO Gateway source - those are
+# release-specific and added by Dockerfile.release on top of this image.
+#
+# Rebuild this only when the base image, toolchains, sysroots, or scripts change
+# (e.g. a DHI CVE patch) - NOT on every Gateway release. See docs/sustainability.md.
+
+ARG SYSROOT_SUITE=bullseye
+ARG GLIBC_TARGET=2.31
+ARG BASE_IMAGE=dhi.io/debian-base:trixie-debian13-dev
+
+############################################################################
+# Stage 1 - glibc-2.31 sysroots (amd64 + arm64 + s390x), from Debian cross pkgs
+############################################################################
+FROM debian:${SYSROOT_SUITE}-slim AS sysroots
+ARG GLIBC_TARGET
+ARG SYSROOT_SUITE
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libc6-dev-amd64-cross  libc6-dev-arm64-cross  libc6-dev-s390x-cross \
+        linux-libc-dev-amd64-cross linux-libc-dev-arm64-cross linux-libc-dev-s390x-cross \
+        gcc-x86-64-linux-gnu   gcc-aarch64-linux-gnu  gcc-s390x-linux-gnu; \
+    rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    for spec in "amd64 x86_64-linux-gnu ld-linux-x86-64.so.2" \
+                "arm64 aarch64-linux-gnu ld-linux-aarch64.so.1" \
+                "s390x s390x-linux-gnu ld64.so.1"; do \
+      set -- $spec; arch=$1; triplet=$2; loader=$3; \
+      SR=/opt/tyk/sysroots/linux-${arch}-glibc-${GLIBC_TARGET}; \
+      mkdir -p "$SR/usr/include" "$SR/usr/lib" "$SR/lib"; \
+      cp -a /usr/${triplet}/include/. "$SR/usr/include/"; \
+      cp -a /usr/${triplet}/lib/.     "$SR/usr/lib/"; \
+      cp -a "$SR/usr/lib/${loader}"   "$SR/lib/" 2>/dev/null || true; \
+      for f in $(grep -rIl "/usr/${triplet}/lib" "$SR/usr/lib" || true); do \
+        sed -i "s#/usr/${triplet}/lib#/usr/lib#g" "$f"; \
+      done; \
+      test -f "$SR/usr/lib/libc.so.6"; test -f "$SR/usr/include/stdlib.h"; \
+    done; \
+    { echo "glibc target : ${GLIBC_TARGET}"; \
+      echo "source suite : debian ${SYSROOT_SUITE} cross packages"; \
+      echo "triplet amd64: x86_64-linux-gnu  (loader /lib64/ld-linux-x86-64.so.2)"; \
+      echo "triplet arm64: aarch64-linux-gnu (loader /lib/ld-linux-aarch64.so.1)"; \
+      echo "triplet s390x: s390x-linux-gnu   (loader /lib/ld64.so.1, big-endian)"; \
+    } > /opt/tyk/sysroots/PROVENANCE.txt
+
+############################################################################
+# Stage 2 - the base toolchain image (no Go, no Gateway source)
+############################################################################
+FROM ${BASE_IMAGE} AS base
+ARG GLIBC_TARGET
+ARG WITH_CXX=1
+ARG WITH_GIT=1
+# Digest of the DHI base this image was built from - the watcher compares this to
+# the live DHI digest to decide when to re-stack (CVE patch) on a new base.
+ARG DHI_DIGEST=unknown
+RUN set -eux; \
+    if command -v apt-get >/dev/null; then \
+        apt-get update; \
+        pkgs="bash jq ca-certificates curl binutils file make \
+              gcc gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu gcc-s390x-linux-gnu"; \
+        [ "$WITH_CXX" = "1" ] && pkgs="$pkgs g++ g++-x86-64-linux-gnu g++-aarch64-linux-gnu g++-s390x-linux-gnu"; \
+        [ "$WITH_GIT" = "1" ] && pkgs="$pkgs git"; \
+        apt-get install -y --no-install-recommends $pkgs; \
+        rm -rf /var/lib/apt/lists/*; \
+    elif command -v apk >/dev/null; then \
+        pkgs="bash jq ca-certificates curl binutils file make gcc glibc-dev"; \
+        [ "$WITH_GIT" = "1" ] && pkgs="$pkgs git"; \
+        apk add --no-cache $pkgs; \
+        # Wolfi: gcc includes C++; cross-gcc is not packaged, so a Wolfi image builds \
+        # NATIVELY for its own arch only (amd64 image -> amd64, arm64 -> arm64). \
+        # Cross targets (s390x, opposite arch) require the Debian/DHI base. \
+    fi
+
+COPY --from=sysroots /opt/tyk/sysroots /opt/tyk/sysroots
+COPY data/build.sh           /build.sh
+COPY data/validate-plugin.sh /usr/local/bin/validate-plugin.sh
+RUN chmod +x /build.sh /usr/local/bin/validate-plugin.sh
+
+# /usr/local/go/bin is on PATH ahead of time; Dockerfile.release drops Go there.
+ENV PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GOTOOLCHAIN=local \
+    GOPATH=/go \
+    GO111MODULE=on \
+    TYK_GW_PATH=/go/src/github.com/TykTechnologies/tyk \
+    PLUGIN_SOURCE_PATH=/plugin-source \
+    TYK_PLUGIN_SYSROOT_BASE=/opt/tyk/sysroots \
+    TYK_GLIBC_TARGET=${GLIBC_TARGET}
+RUN mkdir -p $TYK_GW_PATH $PLUGIN_SOURCE_PATH /go/bin
+
+LABEL org.opencontainers.image.title="compile-tyk-plugin-base" \
+      org.opencontainers.image.description="Stable toolchain+sysroot base for compile-tyk-plugin (no Go, no Gateway source). Community/unofficial." \
+      io.ctp.glibc-target="${GLIBC_TARGET}" \
+      io.ctp.base-image="${BASE_IMAGE}" \
+      io.ctp.dhi-base-digest="${DHI_DIGEST}"
+
+WORKDIR $TYK_GW_PATH
+ENTRYPOINT ["/build.sh"]

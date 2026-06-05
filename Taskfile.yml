@@ -1,0 +1,75 @@
+# Taskfile (https://taskfile.dev) - LOCAL convenience helpers for compile-tyk-plugin.
+#
+# The canonical multi-arch, multi-edition build+publish pipeline is the GitHub
+# workflow .github/workflows/build.yml (resolve -> base -> gate -> publish). This
+# Taskfile only covers local one-offs: building the stable base, the lean proof
+# image, validation, and supply-chain artifacts. Nothing pushes by default.
+#
+# For a full release build of a specific Gateway version, use build.yml (or run
+# scripts/resolve-gateway.sh <version> and feed the values to Dockerfile.release).
+
+version: '3'
+
+vars:
+  IMAGE: '{{.IMAGE | default "compile-tyk-plugin"}}'
+
+tasks:
+  # ---- Stable base layer (toolchains + glibc sysroots; no Go/Gateway) -------
+  build:base:
+    desc: Build the stable base image locally (needs `docker login dhi.io`)
+    cmds:
+      - docker build -f Dockerfile.base -t {{.IMAGE}}-base:local .
+
+  # ---- Lean proof image (no Gateway) for toolchain/sysroot + CVE validation -
+  build:proof:
+    desc: Build the lean proof image used for sysroot/toolchain validation
+    cmds:
+      - docker build -f Dockerfile.proof -t {{.IMAGE}}:proof .
+
+  validate:proof:
+    desc: Run the end-to-end + negative validation suite against the proof image
+    cmds:
+      - ./scripts/validate-proof.sh
+
+  # ---- A release build of one Gateway version (single-arch, local) ----------
+  # Resolves Go/commit/edition settings from the published Gateway, then builds
+  # Dockerfile.release on top of the local base. Multi-arch + gating = build.yml.
+  build:release:
+    desc: 'Build a compiler for one version locally. Vars: VERSION=vX.Y.Z TYK_SRC=/path/to/tyk-checkout'
+    cmds:
+      - test -n "{{.VERSION}}" || (echo "set VERSION=vX.Y.Z" && exit 1)
+      - test -n "{{.TYK_SRC}}" || (echo "set TYK_SRC=/path/to/tyk@VERSION checkout" && exit 1)
+      - ./scripts/resolve-gateway.sh "{{.VERSION}}" > /tmp/ctp-resolve.env
+      - |
+        set -a; . /tmp/ctp-resolve.env; set +a
+        docker build -f Dockerfile.release \
+          --build-arg BASE_IMAGE={{.IMAGE}}-base:local \
+          --build-arg GO_VERSION="$GO_VERSION" \
+          --build-arg GO_SHA256_amd64="$GO_SHA256_amd64" \
+          --build-arg GO_SHA256_arm64="$GO_SHA256_arm64" \
+          --build-arg GITHUB_SHA="$GITHUB_SHA" --build-arg GITHUB_TAG="$GITHUB_TAG" \
+          --build-arg EE_AVAILABLE="$EE_AVAILABLE" --build-arg EE_BUILD_TAG="$EE_BUILD_TAG" \
+          --build-arg FIPS_AVAILABLE="$FIPS_AVAILABLE" --build-arg FIPS_GOFIPS140="$FIPS_GOFIPS140" \
+          --build-arg FIPS_GOEXPERIMENT="$FIPS_GOEXPERIMENT" --build-arg FIPS_BUILD_TAG="$FIPS_BUILD_TAG" \
+          --build-arg CE_ARCHS="$CE_ARCHS" --build-arg EE_ARCHS="$EE_ARCHS" --build-arg FIPS_ARCHS="$FIPS_ARCHS" \
+          -t {{.IMAGE}}:{{.VERSION}} "{{.TYK_SRC}}"
+
+  # ---- Supply chain (artifacts only; no upload) ----------------------------
+  sbom:
+    desc: 'Generate SPDX + CycloneDX SBOMs. Var: REF=<image>'
+    cmds:
+      - mkdir -p artifacts
+      - docker save {{.REF}} -o /tmp/img.tar
+      - syft docker-archive:/tmp/img.tar -o spdx-json      > artifacts/sbom.spdx.json
+      - syft docker-archive:/tmp/img.tar -o cyclonedx-json > artifacts/sbom.cdx.json
+      - rm -f /tmp/img.tar
+
+  scan:
+    desc: 'Trivy CRITICAL/HIGH scan. Var: REF=<image>'
+    cmds:
+      - trivy image --scanners vuln --severity CRITICAL,HIGH {{.REF}}
+
+  scan:compare:
+    desc: Compare CVE counts of the legacy compiler vs the new one (pulls old image)
+    cmds:
+      - ./scripts/cve-compare.sh

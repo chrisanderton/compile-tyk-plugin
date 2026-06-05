@@ -1,0 +1,16 @@
+services:
+  redis:
+    image: redis:6.0-alpine
+    healthcheck: { test: ["CMD","redis-cli","--raw","incr","ping"], interval: 3s, retries: 10, timeout: 5s }
+  gw:
+    image: tykio/tyk-gateway:v5.13.0
+    platform: linux/s390x            # emulated via qemu-s390x (big-endian!)
+    depends_on: [redis]
+    volumes:
+      - ./test-plugin/plugin.so:/opt/tyk-gateway/middleware/plugin.so
+      - ./test-plugin/apidef.json:/opt/tyk-gateway/apps/testplugin.json
+    ports: ["8080:8080"]
+    environment: [TYK_DB_REDISHOST=redis, TYK_LOGLEVEL=debug]
+  httpbin.org:
+    image: kennethreitz/httpbin
+    platform: linux/amd64

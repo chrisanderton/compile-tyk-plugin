@@ -1,0 +1,14 @@
+# Shareable secret guard for anyone who clones this repo.
+# Setup once:  pipx install pre-commit  (or: brew install pre-commit)
+#              pre-commit install
+# Thereafter gitleaks runs automatically on every `git commit`.
+#
+# Note: gitleaks' default rules target high-entropy secrets (API keys, tokens) and
+# can miss weak human-chosen passwords in KEY=value form. The local
+# .git/hooks/pre-commit in this repo adds a keyword check that closes that gap; to
+# enforce it for all clones, add a tuned .gitleaks.toml rule and a CI workflow.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

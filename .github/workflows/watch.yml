@@ -1,0 +1,124 @@
+name: watch
+
+# Auto-rebuild triggers (external - we watch from the outside):
+#   * NEW GATEWAY RELEASE  -> build the compiler for that version.
+#   * NEW DHI BASE DIGEST  -> re-stack (CVE patch) ALL maintained versions on the
+#                            fresh base, even with no Gateway change.
+# The set of versions kept patched is derived from the tags already published to your
+# registry (no manual list to maintain); cap with the maintain_last input below.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"            # daily ~06:17 UTC
+  workflow_dispatch:
+    inputs:
+      force_all:
+        description: "Rebuild all maintained versions regardless of changes"
+        required: false
+        type: boolean
+        default: false
+      maintain_last:
+        description: "On a base change, re-stack only the N most recent published versions (0 = all)"
+        required: false
+        type: string
+        default: "0"
+
+permissions:
+  contents: read
+  actions: write                      # dispatch build.yml
+  packages: read                      # read existing tags / base label
+
+env:
+  IMAGE_NAME: compile-tyk-plugin
+  DHI_BASE: dhi.io/debian-base:trixie-debian13-dev
+  GHCR_NS: ${{ github.repository_owner }}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: imjasonh/setup-crane@v0.4
+      - name: Login to dhi.io
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Decide what to (re)build and dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_ALL: ${{ inputs.force_all || 'false' }}
+          MAINTAIN_LAST: ${{ inputs.maintain_last || '0' }}
+        run: |
+          set -euo pipefail
+          base_ref="ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base:latest"
+          img="ghcr.io/${GHCR_NS}/${IMAGE_NAME}"
+
+          # --- has the DHI base changed since we last built our base? ---
+          dhi_now="$(crane digest "${DHI_BASE}")"
+          dhi_last="$(crane config "$base_ref" 2>/dev/null \
+                      | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty' || true)"
+          dhi_changed=false
+          [ "$dhi_now" != "$dhi_last" ] && dhi_changed=true
+          echo "DHI now=$dhi_now last=${dhi_last:-<none>} changed=$dhi_changed"
+
+          # All editions (oss / ee / fips) ship from the SAME commit under the SAME
+          # version tag, so the OSS GitHub releases list is the canonical version
+          # source. One compiler per version covers all three (OSS+EE by default,
+          # FIPS via -e FIPS=1). We additionally re-trigger if a FIPS gateway lands
+          # AFTER a version's compiler was built (FIPS-coverage gap).
+          # Maintained set = proper-release versions already published to our registry
+          # (no manual file). MAINTAIN_LAST caps to the N most recent (0 = all).
+          published="$(crane ls "$img" 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV || true)"
+          if [ "${MAINTAIN_LAST:-0}" -gt 0 ] 2>/dev/null; then
+            maintained="$(echo "$published" | tail -n "$MAINTAIN_LAST")"
+          else
+            maintained="$published"
+          fi
+          recent="$(gh api repos/TykTechnologies/tyk/releases --paginate \
+                    -q '.[]|select(.prerelease==false)|.tag_name' \
+                    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 5 || true)"
+
+          build_set=""
+          for v in $recent; do
+            if ! crane manifest "${img}:${v}" >/dev/null 2>&1; then
+              echo "-> new release $v (no compiler image yet)"; build_set="$build_set $v"; continue
+            fi
+            # Edition + ARCH coverage: compare each edition Gateway's live published
+            # architectures to what the compiler recorded (io.ctp.<ed>-archs). Any drift -
+            # a new edition appearing, OR an edition gaining an arch (e.g. s390x
+            # EE/FIPS) - triggers a rebuild that picks it up automatically.
+            live_archs() { crane manifest "$1" 2>/dev/null \
+              | jq -r '[.manifests[]?|select((.platform.os//"")=="linux" and (.platform.architecture//"")!="unknown")|.platform.architecture]|sort|unique|join(",")' 2>/dev/null || true; }
+            cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
+            for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
+              ed="${spec%%:*}"; gw="${spec##*:}"
+              live="$(live_archs "${gw}:${v}")"
+              have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
+              if [ "$live" != "$have" ]; then
+                echo "-> $v: $ed architectures changed ('${have}' -> '${live}') - rebuild"; build_set="$build_set $v"
+              fi
+            done
+          done
+          # DHI changed (or forced): re-stack all maintained versions on the new base
+          if [ "$dhi_changed" = "true" ] || [ "$FORCE_ALL" = "true" ]; then
+            echo "-> DHI base changed/forced - re-stacking maintained versions"
+            build_set="$build_set $maintained"
+          fi
+
+          # dedupe + dispatch
+          uniq="$(echo $build_set | tr ' ' '\n' | grep -E '^v' | sort -u || true)"
+          if [ -z "$uniq" ]; then echo "nothing to build"; exit 0; fi
+          # Build both variants in lockstep: the default (DHI) and the Wolfi build.
+          for v in $uniq; do
+            echo "dispatching builds for $v (dhi + wolfi)"
+            gh workflow run build.yml       -f gateway_version="$v" -f push=true || echo "WARN: dhi dispatch failed for $v"
+            gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true || echo "WARN: wolfi dispatch failed for $v"
+          done

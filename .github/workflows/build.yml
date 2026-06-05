@@ -1,0 +1,327 @@
+name: build
+
+# compile-tyk-plugin - community/unofficial multi-arch compiler for Tyk Go plugins.
+# Give it a Gateway version; it resolves the commit + exact Go toolchain from the
+# published Gateway image, builds the two-layer image, and publishes to BOTH
+# Docker Hub and GHCR under your personal namespace.
+#
+# Required secrets:
+#   DOCKERHUB_USER   - Docker Hub username (also used for the dhi.io base pull)
+#   DOCKERHUB_TOKEN  - Docker Hub PAT with Read & Write
+# GHCR uses the built-in GITHUB_TOKEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway_version:
+        description: "Gateway version, e.g. v5.13.0"
+        required: true
+        type: string
+      push:
+        description: "Push to registries"
+        required: false
+        type: boolean
+        default: true
+      gateway_image_repo:
+        description: "CE Gateway image to resolve+gate against (override for a custom build)"
+        required: false
+        type: string
+        default: tykio/tyk-gateway
+      gateway_ee_repo:
+        description: "EE Gateway image (override for a custom build)"
+        required: false
+        type: string
+        default: tykio/tyk-gateway-ee
+      gateway_fips_repo:
+        description: "FIPS Gateway image (override for a custom build)"
+        required: false
+        type: string
+        default: tykio/tyk-gateway-fips
+      source_repo:
+        description: "Gateway source repo to vendor (override for a fork)"
+        required: false
+        type: string
+        default: TykTechnologies/tyk
+      source_ref:
+        description: "Gateway source ref (default: the version tag)"
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      gateway_version:
+        required: true
+        type: string
+      push:
+        required: false
+        type: boolean
+        default: true
+      gateway_image_repo:
+        required: false
+        type: string
+        default: tykio/tyk-gateway
+      gateway_ee_repo:
+        required: false
+        type: string
+        default: tykio/tyk-gateway-ee
+      gateway_fips_repo:
+        required: false
+        type: string
+        default: tykio/tyk-gateway-fips
+      source_repo:
+        required: false
+        type: string
+        default: TykTechnologies/tyk
+      source_ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DOCKERHUB_USER:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+
+env:
+  IMAGE_NAME: compile-tyk-plugin          # change to e.g. "tpc" to rename everywhere
+  DHI_BASE: dhi.io/debian-base:trixie-debian13-dev
+  GHCR_NS: ${{ github.repository_owner }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---- 1. Resolve from the Gateway version (+ current DHI base digest) ------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      go_version: ${{ steps.r.outputs.GO_VERSION }}
+      github_sha: ${{ steps.r.outputs.GITHUB_SHA }}
+      github_tag: ${{ steps.r.outputs.GITHUB_TAG }}
+      sha_amd64:  ${{ steps.r.outputs.GO_SHA256_amd64 }}
+      sha_arm64:  ${{ steps.r.outputs.GO_SHA256_arm64 }}
+      dhi_digest: ${{ steps.dhi.outputs.digest }}
+      date:       ${{ steps.meta.outputs.date }}
+      dh_ns:      ${{ steps.meta.outputs.dh_ns }}
+      ee_available:      ${{ steps.r.outputs.EE_AVAILABLE }}
+      ee_build_tag:      ${{ steps.r.outputs.EE_BUILD_TAG }}
+      fips_available:    ${{ steps.r.outputs.FIPS_AVAILABLE }}
+      fips_gofips140:    ${{ steps.r.outputs.FIPS_GOFIPS140 }}
+      fips_goexperiment: ${{ steps.r.outputs.FIPS_GOEXPERIMENT }}
+      fips_build_tag:    ${{ steps.r.outputs.FIPS_BUILD_TAG }}
+      ce_archs:         ${{ steps.r.outputs.CE_ARCHS }}
+      ee_archs:         ${{ steps.r.outputs.EE_ARCHS }}
+      fips_archs:       ${{ steps.r.outputs.FIPS_ARCHS }}
+      gate_matrix:       ${{ steps.gm.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: imjasonh/setup-crane@v0.4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - id: r
+        env:
+          GATEWAY_REPO: ${{ inputs.gateway_image_repo }}
+          GATEWAY_EE_REPO: ${{ inputs.gateway_ee_repo }}
+          GATEWAY_FIPS_REPO: ${{ inputs.gateway_fips_repo }}
+        run: ./scripts/resolve-gateway.sh "${{ inputs.gateway_version }}"
+      - name: Login to dhi.io (to read the base digest)
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - id: dhi
+        run: echo "digest=$(crane digest ${DHI_BASE})" >> "$GITHUB_OUTPUT"
+      - id: meta
+        run: |
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "dh_ns=${{ secrets.DOCKERHUB_USER }}" >> "$GITHUB_OUTPUT"
+      # Build the gate matrix from the per-edition published architectures - DATA-DRIVEN:
+      # each {edition,arch} that a Gateway actually ships gets gated (s390x via qemu).
+      - id: gm
+        env:
+          TAG: ${{ steps.r.outputs.GITHUB_TAG }}
+          CE_REPO: ${{ inputs.gateway_image_repo }}
+          EE_REPO: ${{ inputs.gateway_ee_repo }}
+          FIPS_REPO: ${{ inputs.gateway_fips_repo }}
+        run: |
+          set -euo pipefail
+          entries() {  # edition  gateway  "arch,list"
+            for a in $(echo "$3" | tr ',' ' '); do
+              case "$a" in
+                arm64) runner=ubuntu-24.04-arm; build=arm64; qemu=false ;;
+                amd64) runner=ubuntu-latest;    build=amd64; qemu=false ;;
+                *)     runner=ubuntu-latest;    build=amd64; qemu=true  ;;  # s390x etc. via qemu
+              esac
+              echo "{\"edition\":\"$1\",\"arch\":\"$a\",\"gateway\":\"$2:$TAG\",\"runner\":\"$runner\",\"build_arch\":\"$build\",\"qemu\":$qemu}"
+            done
+          }
+          {
+            entries ce "$CE_REPO" "${{ steps.r.outputs.CE_ARCHS }}"
+            [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ]   && entries ee "$EE_REPO" "${{ steps.r.outputs.EE_ARCHS }}"
+            [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ] && entries ee-fips "$FIPS_REPO" "${{ steps.r.outputs.FIPS_ARCHS }}"
+          } | jq -sc . | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
+
+  # ---- 2. Stable base, pinned to the current DHI digest (registry-cached) ---
+  base:
+    needs: resolve
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to dhi.io
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.base
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          build-args: |
+            BASE_IMAGE=${{ env.DHI_BASE }}@${{ needs.resolve.outputs.dhi_digest }}
+            DHI_DIGEST=${{ needs.resolve.outputs.dhi_digest }}
+          tags: |
+            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:latest
+            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}-base:latest
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache,mode=max
+
+  # ---- 3. GATE: build a candidate, load a real plugin into the matching -----
+  #         Gateway, assert it runs. Publishing is blocked unless this passes.
+  gate:
+    needs: [resolve, base]
+    strategy:
+      fail-fast: false
+      # Data-driven: one entry per {edition, published arch}. New architectures (e.g. s390x
+      # EE/FIPS) appear here automatically once the Gateway ships them. Native architectures
+      # run on native runners; others (s390x) run the Gateway under QEMU.
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Gateway source @ release commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref != '' && inputs.source_ref || needs.resolve.outputs.github_tag }}
+          path: tyk-src
+      - name: Set up QEMU (emulate the target-arch Gateway, e.g. s390x)
+        if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR (pull base)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build candidate compiler (host ${{ matrix.build_arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: tyk-src
+          file: Dockerfile.release
+          platforms: linux/${{ matrix.build_arch }}
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:candidate-${{ matrix.build_arch }}
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base@${{ needs.base.outputs.digest }}
+            GO_VERSION=${{ needs.resolve.outputs.go_version }}
+            GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
+            GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
+            GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}
+            GITHUB_TAG=${{ needs.resolve.outputs.github_tag }}
+            EE_AVAILABLE=${{ needs.resolve.outputs.ee_available }}
+            EE_BUILD_TAG=${{ needs.resolve.outputs.ee_build_tag }}
+            FIPS_AVAILABLE=${{ needs.resolve.outputs.fips_available }}
+            FIPS_GOFIPS140=${{ needs.resolve.outputs.fips_gofips140 }}
+            FIPS_GOEXPERIMENT=${{ needs.resolve.outputs.fips_goexperiment }}
+            FIPS_BUILD_TAG=${{ needs.resolve.outputs.fips_build_tag }}
+            CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
+            EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
+            FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.build_arch }}
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.build_arch }},mode=max
+      - name: Gate - ${{ matrix.edition }} / ${{ matrix.arch }} (must load into its Gateway)
+        run: ./scripts/loadtest-gate.sh ${{ env.IMAGE_NAME }}:candidate-${{ matrix.build_arch }} ${{ matrix.gateway }} ${{ matrix.edition }} ${{ matrix.arch }}
+
+  # ---- 4. PUBLISH multi-arch -> Docker Hub + GHCR (only if the gate passed) -
+  publish:
+    needs: [resolve, base, gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Gateway source @ release commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref != '' && inputs.source_ref || needs.resolve.outputs.github_tag }}
+          path: tyk-src
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: tyk-src
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          provenance: true
+          sbom: true
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-amd64
+            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-arm64
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base@${{ needs.base.outputs.digest }}
+            GO_VERSION=${{ needs.resolve.outputs.go_version }}
+            GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
+            GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
+            GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}
+            GITHUB_TAG=${{ needs.resolve.outputs.github_tag }}
+            EE_AVAILABLE=${{ needs.resolve.outputs.ee_available }}
+            EE_BUILD_TAG=${{ needs.resolve.outputs.ee_build_tag }}
+            FIPS_AVAILABLE=${{ needs.resolve.outputs.fips_available }}
+            FIPS_GOFIPS140=${{ needs.resolve.outputs.fips_gofips140 }}
+            FIPS_GOEXPERIMENT=${{ needs.resolve.outputs.fips_goexperiment }}
+            FIPS_BUILD_TAG=${{ needs.resolve.outputs.fips_build_tag }}
+            CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
+            EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
+            FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
+          tags: |
+            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}
+            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-${{ needs.resolve.outputs.date }}
+            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}
+            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-${{ needs.resolve.outputs.date }}

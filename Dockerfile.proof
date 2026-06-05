@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.7
+# Lean PROOF image: validates the modern-base + glibc-2.31-sysroot toolchain
+# WITHOUT the heavy Gateway vendoring (which is unchanged from upstream).
+# Reuses the exact sysroot + gotool stages from the production Dockerfile.
+
+ARG GO_VERSION=1.25.10
+ARG SYSROOT_SUITE=bullseye
+ARG GLIBC_TARGET=2.31
+ARG BASE_IMAGE=dhi.io/debian-base:trixie-debian13-dev
+
+# ---- Stage 1: glibc-2.31 sysroots (amd64 + arm64 + s390x) ------------------
+FROM debian:${SYSROOT_SUITE}-slim AS sysroots
+ARG GLIBC_TARGET
+RUN set -eux; apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libc6-dev-amd64-cross libc6-dev-arm64-cross libc6-dev-s390x-cross \
+        gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu gcc-s390x-linux-gnu; \
+    rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    for spec in "amd64 x86_64-linux-gnu ld-linux-x86-64.so.2" \
+                "arm64 aarch64-linux-gnu ld-linux-aarch64.so.1" \
+                "s390x s390x-linux-gnu ld64.so.1"; do \
+      set -- $spec; arch=$1; triplet=$2; loader=$3; \
+      SR=/opt/tyk/sysroots/linux-${arch}-glibc-${GLIBC_TARGET}; \
+      mkdir -p "$SR/usr/include" "$SR/usr/lib" "$SR/lib"; \
+      cp -a /usr/${triplet}/include/. "$SR/usr/include/"; \
+      cp -a /usr/${triplet}/lib/.     "$SR/usr/lib/"; \
+      cp -a "$SR/usr/lib/${loader}"   "$SR/lib/" 2>/dev/null || true; \
+      for f in $(grep -rIl "/usr/${triplet}/lib" "$SR/usr/lib" || true); do \
+        sed -i "s#/usr/${triplet}/lib#/usr/lib#g" "$f"; \
+      done; \
+      test -f "$SR/usr/lib/libc.so.6"; test -f "$SR/usr/include/stdlib.h"; \
+    done
+
+# ---- Stage 2: pinned Go ----------------------------------------------------
+FROM ${BASE_IMAGE} AS gotool
+ARG GO_VERSION
+ARG TARGETARCH
+ARG GO_SHA256_amd64=42d4f7a32316aa66591eca7e89867256057a4264451aca10570a715b3637ba70
+ARG GO_SHA256_arm64=654da1f9b50a5d1c2a85ccf8ed405aa89c06e94d18384628bf186f7712677b08
+RUN set -eux; apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*; \
+    case "${TARGETARCH}" in amd64) sha="${GO_SHA256_amd64}";; arm64) sha="${GO_SHA256_arm64}";; *) exit 1;; esac; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz; \
+    echo "${sha}  /tmp/go.tgz" | sha256sum -c -; \
+    mkdir -p /usr/local; tar -C /usr/local -xzf /tmp/go.tgz; rm /tmp/go.tgz
+
+# ---- Stage 3: lean compiler (no gateway) -----------------------------------
+FROM ${BASE_IMAGE} AS proof
+ARG GLIBC_TARGET
+RUN set -eux; apt-get update; \
+    apt-get install -y --no-install-recommends \
+        bash jq ca-certificates binutils file make \
+        gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+        gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+        gcc-s390x-linux-gnu g++-s390x-linux-gnu; \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=gotool   /usr/local/go     /usr/local/go
+COPY --from=sysroots /opt/tyk/sysroots /opt/tyk/sysroots
+ENV PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GOTOOLCHAIN=local GOPATH=/go \
+    TYK_PLUGIN_SYSROOT_BASE=/opt/tyk/sysroots TYK_GLIBC_TARGET=${GLIBC_TARGET}
+COPY data/validate-plugin.sh /usr/local/bin/validate-plugin.sh
+RUN chmod +x /usr/local/bin/validate-plugin.sh
+WORKDIR /src

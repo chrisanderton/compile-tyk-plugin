@@ -1,0 +1,238 @@
+name: build-wolfi
+
+# Wolfi variant of compile-tyk-plugin, for teams standardised on Chainguard.
+# Wolfi is glibc-based and ships no cross-compilers, so this variant builds
+# NATIVELY for amd64 and arm64 only (no s390x, no cross). It reuses the same
+# resolver as the default (DHI) pipeline and publishes `:vX.Y.Z-wolfi` tags.
+#
+# Secrets: DOCKERHUB_USER / DOCKERHUB_TOKEN (Docker Hub PAT). GHCR uses GITHUB_TOKEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway_version: { description: "Gateway version, e.g. v5.13.0", required: true, type: string }
+      push:           { description: "Push to registries", required: false, type: boolean, default: true }
+  workflow_call:
+    inputs:
+      gateway_version: { required: true, type: string }
+      push:           { required: false, type: boolean, default: true }
+    secrets:
+      DOCKERHUB_USER:  { required: true }
+      DOCKERHUB_TOKEN: { required: true }
+
+env:
+  IMAGE_NAME: compile-tyk-plugin
+  WOLFI_BASE: cgr.dev/chainguard/wolfi-base:latest
+  GHCR_NS: ${{ github.repository_owner }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      go_version: ${{ steps.r.outputs.GO_VERSION }}
+      github_sha: ${{ steps.r.outputs.GITHUB_SHA }}
+      github_tag: ${{ steps.r.outputs.GITHUB_TAG }}
+      sha_amd64:  ${{ steps.r.outputs.GO_SHA256_amd64 }}
+      sha_arm64:  ${{ steps.r.outputs.GO_SHA256_arm64 }}
+      ee_available:      ${{ steps.r.outputs.EE_AVAILABLE }}
+      ee_build_tag:      ${{ steps.r.outputs.EE_BUILD_TAG }}
+      fips_available:    ${{ steps.r.outputs.FIPS_AVAILABLE }}
+      fips_gofips140:    ${{ steps.r.outputs.FIPS_GOFIPS140 }}
+      fips_goexperiment: ${{ steps.r.outputs.FIPS_GOEXPERIMENT }}
+      fips_build_tag:    ${{ steps.r.outputs.FIPS_BUILD_TAG }}
+      # native subset only (amd64/arm64) - Wolfi cannot cross-compile
+      ce_archs:   ${{ steps.n.outputs.ce }}
+      ee_archs:   ${{ steps.n.outputs.ee }}
+      fips_archs: ${{ steps.n.outputs.fips }}
+      gate_matrix: ${{ steps.gm.outputs.matrix }}
+      wolfi_digest: ${{ steps.wd.outputs.digest }}
+      date:  ${{ steps.meta.outputs.date }}
+      dh_ns: ${{ steps.meta.outputs.dh_ns }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: imjasonh/setup-crane@v0.4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - id: r
+        run: ./scripts/resolve-gateway.sh "${{ inputs.gateway_version }}"
+      - id: n
+        run: |
+          native() { echo "$1" | tr ',' '\n' | grep -E '^(amd64|arm64)$' | paste -sd, -; }
+          echo "ce=$(native "${{ steps.r.outputs.CE_ARCHS }}")"     >> "$GITHUB_OUTPUT"
+          echo "ee=$(native "${{ steps.r.outputs.EE_ARCHS }}")"     >> "$GITHUB_OUTPUT"
+          echo "fips=$(native "${{ steps.r.outputs.FIPS_ARCHS }}")" >> "$GITHUB_OUTPUT"
+      - id: gm
+        env:
+          TAG: ${{ steps.r.outputs.GITHUB_TAG }}
+        run: |
+          set -euo pipefail
+          entries() {  # edition  gateway  "arch,list"
+            for a in $(echo "$3" | tr ',' ' '); do
+              case "$a" in
+                arm64) runner=ubuntu-24.04-arm ;;
+                *)     runner=ubuntu-latest ;;
+              esac
+              echo "{\"edition\":\"$1\",\"arch\":\"$a\",\"gateway\":\"$2:$TAG\",\"runner\":\"$runner\"}"
+            done
+          }
+          {
+            entries ce tykio/tyk-gateway "${{ steps.n.outputs.ce }}"
+            [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ]   && entries ee tykio/tyk-gateway-ee "${{ steps.n.outputs.ee }}"
+            [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ] && entries ee-fips tykio/tyk-gateway-fips "${{ steps.n.outputs.fips }}"
+          } | jq -sc . | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
+      - id: wd
+        run: echo "digest=$(crane digest ${WOLFI_BASE})" >> "$GITHUB_OUTPUT"
+      - id: meta
+        run: |
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "dh_ns=${{ secrets.DOCKERHUB_USER }}" >> "$GITHUB_OUTPUT"
+
+  base:
+    needs: resolve
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.base
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          build-args: |
+            BASE_IMAGE=${{ env.WOLFI_BASE }}@${{ needs.resolve.outputs.wolfi_digest }}
+            DHI_DIGEST=${{ needs.resolve.outputs.wolfi_digest }}
+          tags: |
+            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:latest
+            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}-base-wolfi:latest
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache,mode=max
+
+  gate:
+    needs: [resolve, base]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Gateway source @ release commit
+        uses: actions/checkout@v4
+        with:
+          repository: TykTechnologies/tyk
+          ref: ${{ needs.resolve.outputs.github_tag }}
+          path: tyk-src
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR (pull base)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build candidate compiler (Wolfi, ${{ matrix.arch }} native)
+        uses: docker/build-push-action@v6
+        with:
+          context: tyk-src
+          file: Dockerfile.release
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:candidate-wolfi-${{ matrix.arch }}
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi@${{ needs.base.outputs.digest }}
+            GO_VERSION=${{ needs.resolve.outputs.go_version }}
+            GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
+            GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
+            GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}
+            GITHUB_TAG=${{ needs.resolve.outputs.github_tag }}
+            EE_AVAILABLE=${{ needs.resolve.outputs.ee_available }}
+            EE_BUILD_TAG=${{ needs.resolve.outputs.ee_build_tag }}
+            FIPS_AVAILABLE=${{ needs.resolve.outputs.fips_available }}
+            FIPS_GOFIPS140=${{ needs.resolve.outputs.fips_gofips140 }}
+            FIPS_GOEXPERIMENT=${{ needs.resolve.outputs.fips_goexperiment }}
+            FIPS_BUILD_TAG=${{ needs.resolve.outputs.fips_build_tag }}
+            CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
+            EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
+            FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }},mode=max
+      - name: Gate - ${{ matrix.edition }} / ${{ matrix.arch }} (native; must load into its Gateway)
+        run: ./scripts/loadtest-gate.sh ${{ env.IMAGE_NAME }}:candidate-wolfi-${{ matrix.arch }} ${{ matrix.gateway }} ${{ matrix.edition }} ${{ matrix.arch }}
+
+  publish:
+    needs: [resolve, base, gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Gateway source @ release commit
+        uses: actions/checkout@v4
+        with:
+          repository: TykTechnologies/tyk
+          ref: ${{ needs.resolve.outputs.github_tag }}
+          path: tyk-src
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: tyk-src
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          provenance: true
+          sbom: true
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-amd64
+            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-arm64
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi@${{ needs.base.outputs.digest }}
+            GO_VERSION=${{ needs.resolve.outputs.go_version }}
+            GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
+            GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
+            GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}
+            GITHUB_TAG=${{ needs.resolve.outputs.github_tag }}
+            EE_AVAILABLE=${{ needs.resolve.outputs.ee_available }}
+            EE_BUILD_TAG=${{ needs.resolve.outputs.ee_build_tag }}
+            FIPS_AVAILABLE=${{ needs.resolve.outputs.fips_available }}
+            FIPS_GOFIPS140=${{ needs.resolve.outputs.fips_gofips140 }}
+            FIPS_GOEXPERIMENT=${{ needs.resolve.outputs.fips_goexperiment }}
+            FIPS_BUILD_TAG=${{ needs.resolve.outputs.fips_build_tag }}
+            CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
+            EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
+            FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
+          tags: |
+            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi
+            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi-${{ needs.resolve.outputs.date }}
+            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi
+            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi-${{ needs.resolve.outputs.date }}

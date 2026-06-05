@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.7
+#
+# tyk-plugin-compiler-RELEASE - the THIN per-Gateway-release layer.
+# Stacks the release-specific bits onto the stable base:
+#   * the EXACT Go toolchain the Gateway was built with (GO_VERSION, derived)
+#   * the vendored Gateway source at the release commit (build context)
+#
+# Build context MUST be a checkout of github.com/TykTechnologies/tyk at the
+# release tag/commit. All values are produced by scripts/resolve-gateway.sh.
+#
+#   docker buildx build -f Dockerfile.release \
+#     --build-arg BASE_IMAGE=ghcr.io/<owner>/tyk-plugin-compiler-base:<tag> \
+#     --build-arg GO_VERSION=go1.25.10 \
+#     --build-arg GO_SHA256_amd64=... --build-arg GO_SHA256_arm64=... \
+#     --build-arg GITHUB_SHA=<sha> --build-arg GITHUB_TAG=v5.13.0 \
+#     --platform linux/amd64,linux/arm64 -t ... <tyk-checkout-dir>
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# --- Exact Go toolchain (release-specific) ---------------------------------
+ARG GO_VERSION
+ARG TARGETARCH
+ARG GO_SHA256_amd64
+ARG GO_SHA256_arm64
+RUN set -eux; \
+    v="${GO_VERSION#go}"; \
+    case "${TARGETARCH}" in \
+      amd64) sha="${GO_SHA256_amd64}";; \
+      arm64) sha="${GO_SHA256_arm64}";; \
+      *) echo "compiler image only builds for amd64/arm64 hosts (got ${TARGETARCH})" >&2; exit 1;; \
+    esac; \
+    curl -fsSL "https://go.dev/dl/go${v}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz; \
+    echo "${sha}  /tmp/go.tgz" | sha256sum -c -; \
+    mkdir -p /usr/local; tar -C /usr/local -xzf /tmp/go.tgz; rm /tmp/go.tgz; \
+    /usr/local/go/bin/go version
+
+# --- Vendor the Gateway source at the release commit (ABI alignment) -------
+ADD go.mod go.sum $TYK_GW_PATH/
+WORKDIR $TYK_GW_PATH
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
+
+ADD . $TYK_GW_PATH
+
+ARG GITHUB_SHA
+ARG GITHUB_TAG
+ARG BUILD_TAG
+ARG GOFIPS140
+ENV GITHUB_SHA=${GITHUB_SHA} \
+    GITHUB_TAG=${GITHUB_TAG} \
+    BUILD_TAG=${BUILD_TAG} \
+    GOFIPS140=${GOFIPS140}
+
+# --- Per-edition settings for THIS release (resolved from the edition Gateways) ---
+# Baked so users select the edition at use time: `-e EDITION=ce|ee|ee-fips`
+# (FIPS=1 = alias for ee-fips). EE adds the 'ee' tag; ee-fips adds FIPS crypto.
+ARG EE_AVAILABLE=false
+ARG EE_BUILD_TAG=
+ARG FIPS_AVAILABLE=false
+ARG FIPS_GOFIPS140=
+ARG FIPS_GOEXPERIMENT=
+ARG FIPS_BUILD_TAG=
+# Per-edition published architectures (space-separated), read from the live Gateway
+# manifests at build time - data-driven so new architectures (e.g. s390x EE/FIPS) are
+# honoured on the next rebuild without code changes.
+ARG CE_ARCHS=amd64,arm64,s390x
+ARG EE_ARCHS=
+ARG FIPS_ARCHS=
+ENV TYK_EE_AVAILABLE=${EE_AVAILABLE} \
+    TYK_EE_BUILD_TAG=${EE_BUILD_TAG} \
+    TYK_FIPS_AVAILABLE=${FIPS_AVAILABLE} \
+    TYK_FIPS_GOFIPS140=${FIPS_GOFIPS140} \
+    TYK_FIPS_GOEXPERIMENT=${FIPS_GOEXPERIMENT} \
+    TYK_FIPS_BUILD_TAG=${FIPS_BUILD_TAG} \
+    TYK_CE_ARCHS=${CE_ARCHS} \
+    TYK_EE_ARCHS=${EE_ARCHS} \
+    TYK_FIPS_ARCHS=${FIPS_ARCHS}
+
+# --- Optional baked Gateway self-test binary (~538 MB; off by default here) -
+ARG WITH_GATEWAY_SELFTEST=0
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    if [ "$WITH_GATEWAY_SELFTEST" = "1" ]; then \
+      GOBIN=/usr/local/bin go install -tags=goplugin${BUILD_TAG:+,$BUILD_TAG} -trimpath . || \
+        echo "WARN: gateway self-test binary not built"; \
+    else echo "skipping gateway self-test binary (WITH_GATEWAY_SELFTEST=0)"; fi
+
+LABEL org.opencontainers.image.title="compile-tyk-plugin" \
+      org.opencontainers.image.description="Community/unofficial modern low-CVE compiler for Tyk Go plugins (DHI base, glibc-2.31 sysroot). Not affiliated with Tyk." \
+      org.opencontainers.image.source="https://github.com/TykTechnologies/tyk" \
+      org.opencontainers.image.version="${GITHUB_TAG}" \
+      org.opencontainers.image.revision="${GITHUB_SHA}" \
+      io.ctp.go-version="${GO_VERSION}" \
+      io.ctp.ee-available="${EE_AVAILABLE}" \
+      io.ctp.fips-available="${FIPS_AVAILABLE}" \
+      io.ctp.ce-archs="${CE_ARCHS}" \
+      io.ctp.ee-archs="${EE_ARCHS}" \
+      io.ctp.fips-archs="${FIPS_ARCHS}"
+
+WORKDIR $TYK_GW_PATH
+# ENTRYPOINT (/build.sh) inherited from the base image.
