@@ -5,9 +5,11 @@ name: build
 # published Gateway image, builds the two-layer image, and publishes to BOTH
 # Docker Hub and GHCR under your personal namespace.
 #
-# Required secrets:
-#   DOCKERHUB_USER   - Docker Hub username (also used for the dhi.io base pull)
-#   DOCKERHUB_TOKEN  - Docker Hub PAT with Read & Write
+# Required configuration (Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USER   - repository VARIABLE: Docker Hub username + push namespace
+#                      (not a secret - it is the registry namespace and must be readable)
+#   DOCKERHUB_TOKEN  - repository SECRET:   Docker Hub PAT with Read & Write
+#                      (pushes to Docker Hub and pulls the dhi.io base)
 # GHCR uses the built-in GITHUB_TOKEN.
 
 on:
@@ -77,8 +79,6 @@ on:
         type: string
         default: ""
     secrets:
-      DOCKERHUB_USER:
-        required: true
       DOCKERHUB_TOKEN:
         required: true
 
@@ -115,9 +115,17 @@ jobs:
       fips_archs:       ${{ steps.r.outputs.FIPS_ARCHS }}
       gate_matrix:       ${{ steps.gm.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      # Variables cannot be declared "required" in workflow_call, so guard at runtime.
+      - name: Check required config
+        env:
+          DH_USER: ${{ vars.DOCKERHUB_USER }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          [ -n "$DH_USER" ]  || { echo "::error::Set repository VARIABLE DOCKERHUB_USER (Settings -> Secrets and variables -> Actions -> Variables). It is your Docker Hub username and push namespace."; exit 1; }
+          [ -n "$DH_TOKEN" ] || { echo "::error::Set repository SECRET DOCKERHUB_TOKEN (a Docker Hub Read & Write PAT)."; exit 1; }
       - uses: imjasonh/setup-crane@v0.4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "stable"
       - id: r
@@ -127,17 +135,17 @@ jobs:
           GATEWAY_FIPS_REPO: ${{ inputs.gateway_fips_repo }}
         run: ./scripts/resolve-gateway.sh "${{ inputs.gateway_version }}"
       - name: Login to dhi.io (to read the base digest)
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: dhi.io
-          username: ${{ secrets.DOCKERHUB_USER }}
+          username: ${{ vars.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: dhi
         run: echo "digest=$(crane digest ${DHI_BASE})" >> "$GITHUB_OUTPUT"
       - id: meta
         run: |
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "dh_ns=${{ secrets.DOCKERHUB_USER }}" >> "$GITHUB_OUTPUT"
+          echo "dh_ns=${{ vars.DOCKERHUB_USER }}" >> "$GITHUB_OUTPUT"
       # Build the gate matrix from the per-edition published architectures - DATA-DRIVEN:
       # each {edition,arch} that a Gateway actually ships gets gated (s390x via qemu).
       - id: gm
@@ -171,29 +179,29 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
       - name: Login to dhi.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: dhi.io
-          username: ${{ secrets.DOCKERHUB_USER }}
+          username: ${{ vars.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USER }}
+          username: ${{ vars.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.base
@@ -221,25 +229,25 @@ jobs:
         include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Checkout Gateway source @ release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref != '' && inputs.source_ref || needs.resolve.outputs.github_tag }}
           path: tyk-src
       - name: Set up QEMU (emulate the target-arch Gateway, e.g. s390x)
         if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+        uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
       - name: Login to GHCR (pull base)
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build candidate compiler (host ${{ matrix.build_arch }})
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: tyk-src
           file: Dockerfile.release
@@ -272,28 +280,28 @@ jobs:
     needs: [resolve, base, gate]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Checkout Gateway source @ release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref != '' && inputs.source_ref || needs.resolve.outputs.github_tag }}
           path: tyk-src
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USER }}
+          username: ${{ vars.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: tyk-src
           file: Dockerfile.release

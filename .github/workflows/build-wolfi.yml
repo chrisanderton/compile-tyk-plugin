@@ -5,7 +5,8 @@ name: build-wolfi
 # NATIVELY for amd64 and arm64 only (no s390x, no cross). It reuses the same
 # resolver as the default (DHI) pipeline and publishes `:vX.Y.Z-wolfi` tags.
 #
-# Secrets: DOCKERHUB_USER / DOCKERHUB_TOKEN (Docker Hub PAT). GHCR uses GITHUB_TOKEN.
+# Config: DOCKERHUB_USER (repo variable = username + namespace) and DOCKERHUB_TOKEN
+# (repo secret = Docker Hub PAT, Read & Write). GHCR uses the built-in GITHUB_TOKEN.
 
 on:
   workflow_dispatch:
@@ -17,7 +18,6 @@ on:
       gateway_version: { required: true, type: string }
       push:           { required: false, type: boolean, default: true }
     secrets:
-      DOCKERHUB_USER:  { required: true }
       DOCKERHUB_TOKEN: { required: true }
 
 env:
@@ -53,9 +53,16 @@ jobs:
       date:  ${{ steps.meta.outputs.date }}
       dh_ns: ${{ steps.meta.outputs.dh_ns }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Check required config
+        env:
+          DH_USER: ${{ vars.DOCKERHUB_USER }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          [ -n "$DH_USER" ]  || { echo "::error::Set repository VARIABLE DOCKERHUB_USER (Docker Hub username + push namespace)."; exit 1; }
+          [ -n "$DH_TOKEN" ] || { echo "::error::Set repository SECRET DOCKERHUB_TOKEN (Docker Hub Read & Write PAT)."; exit 1; }
       - uses: imjasonh/setup-crane@v0.4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "stable"
       - id: r
@@ -90,7 +97,7 @@ jobs:
       - id: meta
         run: |
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "dh_ns=${{ secrets.DOCKERHUB_USER }}" >> "$GITHUB_OUTPUT"
+          echo "dh_ns=${{ vars.DOCKERHUB_USER }}" >> "$GITHUB_OUTPUT"
 
   base:
     needs: resolve
@@ -98,23 +105,23 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USER }}
+          username: ${{ vars.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.base
@@ -137,22 +144,22 @@ jobs:
         include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Checkout Gateway source @ release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: TykTechnologies/tyk
           ref: ${{ needs.resolve.outputs.github_tag }}
           path: tyk-src
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Login to GHCR (pull base)
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build candidate compiler (Wolfi, ${{ matrix.arch }} native)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: tyk-src
           file: Dockerfile.release
@@ -184,27 +191,27 @@ jobs:
     needs: [resolve, base, gate]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Checkout Gateway source @ release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: TykTechnologies/tyk
           ref: ${{ needs.resolve.outputs.github_tag }}
           path: tyk-src
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USER }}
+          username: ${{ vars.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: tyk-src
           file: Dockerfile.release

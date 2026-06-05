@@ -109,14 +109,22 @@ under your namespace. The external contract is a single input: the Gateway versi
 
 ## CI credentials
 
-The workflows need one secret pair: `DOCKERHUB_USER` and `DOCKERHUB_TOKEN`. The token is
-a Docker Hub Personal Access Token with **Read & Write** scope - Write to push images,
-Read to pull the `dhi.io` base. GHCR uses the built-in `GITHUB_TOKEN`.
+The workflows need two pieces of configuration under Settings -> Secrets and variables
+-> Actions:
+
+- `DOCKERHUB_USER` - a repository **variable** (not a secret): your Docker Hub username,
+  which is also the push namespace (`docker.io/<DOCKERHUB_USER>/...`). It must be a
+  variable, not a secret, because GitHub masks secrets and refuses to expose them as step
+  outputs - a namespace stored as a secret collapses the push tag to `docker.io//...`.
+- `DOCKERHUB_TOKEN` - a repository **secret**: a Docker Hub Personal Access Token with
+  **Read & Write** scope. Write pushes images; Read pulls the `dhi.io` base. One token
+  works for both `docker login docker.io` and `docker login dhi.io`.
+
+GHCR uses the built-in `GITHUB_TOKEN`. Each workflow's first job runs a preflight that
+fails fast if either value is unset (GitHub has no way to declare a variable `required`).
 
 To create the token: Docker Hub - Account settings - Personal access tokens - Generate
-new token. A single token works for both `docker login docker.io` and
-`docker login dhi.io`. Store it as the `DOCKERHUB_TOKEN` repository secret and your
-username as `DOCKERHUB_USER`.
+new token.
 
 ## Renaming the image
 

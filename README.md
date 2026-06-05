@@ -148,8 +148,9 @@ resolve (Gateway version -> Go ver, commit, EE/FIPS settings, Go checksums)
               multi-arch -> GHCR + Docker Hub, SBOM + provenance)
 ```
 - `.github/workflows/build.yml` - run it with a `gateway_version` (custom `*_repo` /
-  `source_*` inputs optional). Secrets: `DOCKERHUB_USER` / `DOCKERHUB_TOKEN` (a Read &
-  Write PAT - also pulls the `dhi.io` base); GHCR uses the built-in `GITHUB_TOKEN`.
+  `source_*` inputs optional). Config: `DOCKERHUB_USER` (repo **variable** = username +
+  namespace) and `DOCKERHUB_TOKEN` (repo **secret** = Read & Write PAT, also pulls the
+  `dhi.io` base); GHCR uses the built-in `GITHUB_TOKEN`.
 - `.github/workflows/watch.yml` - daily; auto-builds **new proper releases** (no rc/alpha)
   and re-stacks when the DHI base or an EE/FIPS gateway changes.
 - Local checks without the heavy build: `docker build -f Dockerfile.proof -t ctp:proof .`
