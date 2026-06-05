@@ -235,44 +235,45 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache,mode=max
 
-  # ---- 3. GATE: build a candidate, load a real plugin into the matching -----
-  #         Gateway, assert it runs. Publishing is blocked unless this passes.
-  gate:
+  # ---- 3. Build the compiler ONCE per arch, push to GHCR by digest -----------
+  #         The compiler image is EDITION-AGNOSTIC (edition is a runtime -e EDITION flag),
+  #         so it is built once per arch and reused by every gate cell AND by publish -
+  #         instead of rebuilding it for each {edition, arch}. Native runners, no QEMU.
+  build-candidate:
     needs: [resolve, base]
     strategy:
       fail-fast: false
-      # Data-driven: one entry per {edition, published arch}. New architectures (e.g. s390x
-      # EE/FIPS) appear here automatically once the Gateway ships them. Native architectures
-      # run on native runners; others (s390x) run the Gateway under QEMU.
       matrix:
-        include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
       - name: Checkout Gateway source @ release commit
         uses: actions/checkout@v5
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref != '' && inputs.source_ref || needs.resolve.outputs.github_tag }}
           path: tyk-src
-      - name: Set up QEMU (emulate the target-arch Gateway, e.g. s390x)
-        if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - name: Login to GHCR (pull base)
+      - name: Login to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build candidate compiler (host ${{ matrix.build_arch }})
+      - id: build
         uses: docker/build-push-action@v7
         with:
           context: tyk-src
           file: Dockerfile.release
-          platforms: linux/${{ matrix.build_arch }}
-          load: true
-          tags: ${{ env.IMAGE_NAME }}:candidate-${{ matrix.build_arch }}
+          platforms: linux/${{ matrix.arch }}
+          provenance: true
+          sbom: true
+          # push-by-digest: no tag, just an immutable digest the gate + publish reference.
+          outputs: type=image,name=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base@${{ needs.base.outputs.digest }}
             GO_VERSION=${{ needs.resolve.outputs.go_version }}
@@ -289,27 +290,60 @@ jobs:
             CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
             EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
             FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
-          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.build_arch }}
-          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.build_arch }},mode=max
-      - name: Gate - ${{ matrix.edition }} / ${{ matrix.arch }} (must load into its Gateway)
-        run: ./scripts/loadtest-gate.sh ${{ env.IMAGE_NAME }}:candidate-${{ matrix.build_arch }} ${{ matrix.gateway }} ${{ matrix.edition }} ${{ matrix.arch }}
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }},mode=max
+      - name: Export per-arch digest
+        run: |
+          mkdir -p /tmp/digest
+          printf '%s' "${{ steps.build.outputs.digest }}" > /tmp/digest/${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-digest-${{ matrix.arch }}
+          path: /tmp/digest/${{ matrix.arch }}
+          retention-days: 1
 
-  # ---- 4. PUBLISH multi-arch -> Docker Hub + GHCR (only if the gate passed) -
+  # ---- 4. GATE: pull the per-arch candidate and load a real plugin into the matching
+  #         Gateway for every {edition, arch}. No build here - just the ABI proof.
+  gate:
+    needs: [resolve, build-candidate]
+    strategy:
+      fail-fast: false
+      # Data-driven: one entry per {edition, published arch}. New architectures (e.g. s390x
+      # EE/FIPS) appear here automatically once the Gateway ships them. Native architectures
+      # run on native runners; others (s390x) run the Gateway under QEMU.
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up QEMU (emulate the target-arch Gateway, e.g. s390x)
+        if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@v4
+      - name: Login to GHCR (pull candidate)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-digest-${{ matrix.build_arch }}
+          path: /tmp/digest
+      - name: Gate - ${{ matrix.edition }} / ${{ matrix.arch }} (must load into its Gateway)
+        run: |
+          DIGEST="$(cat /tmp/digest/${{ matrix.build_arch }})"
+          ./scripts/loadtest-gate.sh \
+            "ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}@${DIGEST}" \
+            ${{ matrix.gateway }} ${{ matrix.edition }} ${{ matrix.arch }}
+
+  # ---- 5. PUBLISH: stitch the gated per-arch images into one multi-arch manifest and
+  #         tag it in GHCR + Docker Hub. NO rebuild - we publish the exact images the
+  #         gate proved load into the Gateway. imagetools copies blobs cross-registry.
   publish:
-    needs: [resolve, base, gate]
-    # On a push=false dry run the gate is the whole point; skip the multi-arch publish
-    # build entirely (it would build and discard). Real runs (push=true) publish.
+    needs: [resolve, build-candidate, gate]
     if: ${{ inputs.push }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - name: Checkout Gateway source @ release commit
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.source_ref != '' && inputs.source_ref || needs.resolve.outputs.github_tag }}
-          path: tyk-src
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - name: Login to Docker Hub
         uses: docker/login-action@v4
@@ -323,35 +357,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - uses: actions/download-artifact@v4
         with:
-          context: tyk-src
-          file: Dockerfile.release
-          platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.push }}
-          provenance: true
-          sbom: true
-          cache-from: |
-            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-amd64
-            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-arm64
-          build-args: |
-            BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base@${{ needs.base.outputs.digest }}
-            GO_VERSION=${{ needs.resolve.outputs.go_version }}
-            GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
-            GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
-            GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}
-            GITHUB_TAG=${{ needs.resolve.outputs.github_tag }}
-            EE_AVAILABLE=${{ needs.resolve.outputs.ee_available }}
-            EE_BUILD_TAG=${{ needs.resolve.outputs.ee_build_tag }}
-            FIPS_AVAILABLE=${{ needs.resolve.outputs.fips_available }}
-            FIPS_GOFIPS140=${{ needs.resolve.outputs.fips_gofips140 }}
-            FIPS_GOEXPERIMENT=${{ needs.resolve.outputs.fips_goexperiment }}
-            FIPS_BUILD_TAG=${{ needs.resolve.outputs.fips_build_tag }}
-            CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
-            EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
-            FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
-          tags: |
-            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}
-            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-${{ needs.resolve.outputs.date }}
-            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}
-            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-${{ needs.resolve.outputs.date }}
+          pattern: candidate-digest-*
+          path: /tmp/digest
+          merge-multiple: true
+      - name: Assemble multi-arch manifest from the gated per-arch images
+        env:
+          GHCR_IMG: ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}
+          DH_IMG: docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ needs.resolve.outputs.github_tag }}
+          DATE: ${{ needs.resolve.outputs.date }}
+        run: |
+          AMD="$(cat /tmp/digest/amd64)"
+          ARM="$(cat /tmp/digest/arm64)"
+          docker buildx imagetools create \
+            -t "${GHCR_IMG}:${TAG}" -t "${GHCR_IMG}:${TAG}-${DATE}" \
+            -t "${DH_IMG}:${TAG}"   -t "${DH_IMG}:${TAG}-${DATE}" \
+            "${GHCR_IMG}@${AMD}" "${GHCR_IMG}@${ARM}"

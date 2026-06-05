@@ -153,15 +153,20 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache,mode=max
 
-  gate:
+  # Build the Wolfi compiler ONCE per arch (edition-agnostic), push to GHCR by digest.
+  # Native amd64/arm64 only - Wolfi has no cross toolchain. Reused by gate + publish.
+  build-candidate:
     needs: [resolve, base]
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
       - name: Checkout Gateway source @ release commit
         uses: actions/checkout@v5
         with:
@@ -169,20 +174,21 @@ jobs:
           ref: ${{ needs.resolve.outputs.github_tag }}
           path: tyk-src
       - uses: docker/setup-buildx-action@v4
-      - name: Login to GHCR (pull base)
+      - name: Login to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build candidate compiler (Wolfi, ${{ matrix.arch }} native)
+      - id: build
         uses: docker/build-push-action@v7
         with:
           context: tyk-src
           file: Dockerfile.release
           platforms: linux/${{ matrix.arch }}
-          load: true
-          tags: ${{ env.IMAGE_NAME }}:candidate-wolfi-${{ matrix.arch }}
+          provenance: true
+          sbom: true
+          outputs: type=image,name=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi@${{ needs.base.outputs.digest }}
             GO_VERSION=${{ needs.resolve.outputs.go_version }}
@@ -201,22 +207,48 @@ jobs:
             FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }}
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }},mode=max
-      - name: Gate - ${{ matrix.edition }} / ${{ matrix.arch }} (native; must load into its Gateway)
-        run: ./scripts/loadtest-gate.sh ${{ env.IMAGE_NAME }}:candidate-wolfi-${{ matrix.arch }} ${{ matrix.gateway }} ${{ matrix.edition }} ${{ matrix.arch }}
+      - name: Export per-arch digest
+        run: |
+          mkdir -p /tmp/digest
+          printf '%s' "${{ steps.build.outputs.digest }}" > /tmp/digest/${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-digest-wolfi-${{ matrix.arch }}
+          path: /tmp/digest/${{ matrix.arch }}
+          retention-days: 1
 
+  gate:
+    needs: [resolve, build-candidate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.gate_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Login to GHCR (pull candidate)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-digest-wolfi-${{ matrix.build_arch }}
+          path: /tmp/digest
+      - name: Gate - ${{ matrix.edition }} / ${{ matrix.arch }} (native; must load into its Gateway)
+        run: |
+          DIGEST="$(cat /tmp/digest/${{ matrix.build_arch }})"
+          ./scripts/loadtest-gate.sh \
+            "ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}@${DIGEST}" \
+            ${{ matrix.gateway }} ${{ matrix.edition }} ${{ matrix.arch }}
+
+  # Stitch the gated per-arch Wolfi images into one multi-arch -wolfi manifest. No rebuild.
   publish:
-    needs: [resolve, base, gate]
-    # Dry runs (push=false) stop at the gate; skip the multi-arch publish build.
+    needs: [resolve, build-candidate, gate]
     if: ${{ inputs.push }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - name: Checkout Gateway source @ release commit
-        uses: actions/checkout@v5
-        with:
-          repository: TykTechnologies/tyk
-          ref: ${{ needs.resolve.outputs.github_tag }}
-          path: tyk-src
       - uses: docker/setup-buildx-action@v4
       - name: Login to Docker Hub
         uses: docker/login-action@v4
@@ -230,35 +262,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - uses: actions/download-artifact@v4
         with:
-          context: tyk-src
-          file: Dockerfile.release
-          platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.push }}
-          provenance: true
-          sbom: true
-          cache-from: |
-            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-amd64
-            type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-arm64
-          build-args: |
-            BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi@${{ needs.base.outputs.digest }}
-            GO_VERSION=${{ needs.resolve.outputs.go_version }}
-            GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
-            GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
-            GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}
-            GITHUB_TAG=${{ needs.resolve.outputs.github_tag }}
-            EE_AVAILABLE=${{ needs.resolve.outputs.ee_available }}
-            EE_BUILD_TAG=${{ needs.resolve.outputs.ee_build_tag }}
-            FIPS_AVAILABLE=${{ needs.resolve.outputs.fips_available }}
-            FIPS_GOFIPS140=${{ needs.resolve.outputs.fips_gofips140 }}
-            FIPS_GOEXPERIMENT=${{ needs.resolve.outputs.fips_goexperiment }}
-            FIPS_BUILD_TAG=${{ needs.resolve.outputs.fips_build_tag }}
-            CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
-            EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
-            FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
-          tags: |
-            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi
-            ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi-${{ needs.resolve.outputs.date }}
-            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi
-            docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.github_tag }}-wolfi-${{ needs.resolve.outputs.date }}
+          pattern: candidate-digest-wolfi-*
+          path: /tmp/digest
+          merge-multiple: true
+      - name: Assemble multi-arch -wolfi manifest from the gated per-arch images
+        env:
+          GHCR_IMG: ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}
+          DH_IMG: docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ needs.resolve.outputs.github_tag }}
+          DATE: ${{ needs.resolve.outputs.date }}
+        run: |
+          AMD="$(cat /tmp/digest/amd64)"
+          ARM="$(cat /tmp/digest/arm64)"
+          docker buildx imagetools create \
+            -t "${GHCR_IMG}:${TAG}-wolfi" -t "${GHCR_IMG}:${TAG}-wolfi-${DATE}" \
+            -t "${DH_IMG}:${TAG}-wolfi"   -t "${DH_IMG}:${TAG}-wolfi-${DATE}" \
+            "${GHCR_IMG}@${AMD}" "${GHCR_IMG}@${ARM}"
