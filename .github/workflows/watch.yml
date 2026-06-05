@@ -1,11 +1,20 @@
 name: watch
 
 # Auto-rebuild triggers (external - we watch from the outside):
-#   * NEW GATEWAY RELEASE  -> build the compiler for that version.
+#   * ACTIVE GATEWAY LINE  -> build the compiler for it. Candidate versions are the
+#                            proper-semver git tags that ALSO have a published gateway
+#                            image (git tags INTERSECT registry tags). GitHub Releases
+#                            are NOT used: Tyk's release objects are inconsistent (e.g.
+#                            v5.13.0 ships a tag + image but has no Release; some RCs are
+#                            flagged prerelease=false). From the candidates we keep the
+#                            TIP of each line patched within activity_days, plus the
+#                            latest release - this tracks "latest + active LTS" with no
+#                            hand-maintained list (a non-LTS line stops getting tags at
+#                            EOL; an LTS keeps getting them ~24 months).
 #   * NEW DHI BASE DIGEST  -> re-stack (CVE patch) ALL maintained versions on the
 #                            fresh base, even with no Gateway change.
-# The set of versions kept patched is derived from the tags already published to your
-# registry (no manual list to maintain); cap with the maintain_last input below.
+# Tune discovery with activity_days (first-run seed: 30) and the re-stack with
+# maintain_last. See docs/maintenance.md.
 
 on:
   schedule:
@@ -22,6 +31,11 @@ on:
         required: false
         type: string
         default: "0"
+      activity_days:
+        description: "Maintain the tip of each line whose latest image is younger than N days (+ always the latest release). First-run seed: 30 (latest + active LTS only)."
+        required: false
+        type: string
+        default: "120"
 
 permissions:
   contents: read
@@ -45,6 +59,12 @@ jobs:
           registry: dhi.io
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to Docker Hub
+        # authenticated crane ls/manifest against tykio/* (avoids anonymous rate limits)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -56,6 +76,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FORCE_ALL: ${{ inputs.force_all || 'false' }}
           MAINTAIN_LAST: ${{ inputs.maintain_last || '0' }}
+          ACTIVITY_DAYS: ${{ inputs.activity_days || '120' }}
+          SOURCE_REPO: TykTechnologies/tyk
+          GW_CE_REPO: tykio/tyk-gateway
         run: |
           set -euo pipefail
           base_ref="ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base:latest"
@@ -70,11 +93,9 @@ jobs:
           echo "DHI now=$dhi_now last=${dhi_last:-<none>} changed=$dhi_changed"
 
           # All editions (oss / ee / fips) ship from the SAME commit under the SAME
-          # version tag, so the OSS GitHub releases list is the canonical version
-          # source. One compiler per version covers all three (OSS+EE by default,
-          # FIPS via -e FIPS=1). We additionally re-trigger if a FIPS gateway lands
-          # AFTER a version's compiler was built (FIPS-coverage gap).
-          # Maintained set = proper-release versions already published to our registry
+          # version tag, so one compiler per version covers all three (OSS+EE by
+          # default, FIPS via EDITION=ee-fips).
+          # Maintained set = proper-release versions already published to OUR registry
           # (no manual file). MAINTAIN_LAST caps to the N most recent (0 = all).
           published="$(crane ls "$img" 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV || true)"
           if [ "${MAINTAIN_LAST:-0}" -gt 0 ] 2>/dev/null; then
@@ -82,9 +103,48 @@ jobs:
           else
             maintained="$published"
           fi
-          recent="$(gh api repos/TykTechnologies/tyk/releases --paginate \
-                    -q '.[]|select(.prerelease==false)|.tag_name' \
-                    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 5 || true)"
+
+          # --- discover buildable Gateway versions: git tags INTERSECT registry tags ---
+          # A version is buildable only if it exists BOTH as a proper-semver git tag
+          # (its source can be vendored) AND as a published gateway image (it can be
+          # resolved + gated). Cross-checking both is the reliable source of truth; the
+          # GitHub Releases API is inconsistent (no v5.13.0 object; some RCs mislabelled
+          # prerelease=false). The ^vX.Y.Z$ regex drops every rc/alpha/beta regardless.
+          SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          git_tags="$(git ls-remote --tags --refs "https://github.com/${SOURCE_REPO}.git" 2>/dev/null \
+                      | sed 's#.*refs/tags/##' | grep -E "$SEMVER" | sort -uV || true)"
+          reg_tags="$(crane ls "$GW_CE_REPO" 2>/dev/null | grep -E "$SEMVER" | sort -uV || true)"
+          # intersection: git tags that are also published images (empty reg/git -> empty).
+          # Temp files (not <(...) process substitution) so it is shell-agnostic.
+          gt="$(mktemp)"; rt="$(mktemp)"
+          printf '%s\n' "$git_tags" > "$gt"; printf '%s\n' "$reg_tags" > "$rt"
+          buildable="$(grep -Fxf "$rt" "$gt" | sort -uV || true)"
+          rm -f "$gt" "$rt"
+          # Select what to maintain by ACTIVITY, not by raw version rank. Tyk's LTS
+          # policy means the supported set is "the latest release + the active LTS
+          # lines" - and those are exactly the lines still receiving patches. A non-LTS
+          # minor is EOL the moment its successor ships, so it stops getting tags; an
+          # LTS keeps getting them for ~24 months. So: keep the TIP (highest patch) of
+          # each minor line whose tip image was published within ACTIVITY_DAYS, plus
+          # always the single latest release. No hand-maintained LTS list.
+          latest="$(printf '%s\n' "$buildable" | tail -n 1 || true)"
+          cutoff="$(date -u -d "${ACTIVITY_DAYS} days ago" +%F 2>/dev/null \
+                    || date -u -v-"${ACTIVITY_DAYS}"d +%F)"
+          minors="$(printf '%s\n' "$buildable" | sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/' | sort -uV | uniq)"
+          active=""
+          for m in $minors; do
+            tip="$(printf '%s\n' "$buildable" | grep -E "^v${m}\." | sort -V | tail -n 1)"
+            created="$(crane config "${GW_CE_REPO}:${tip}" 2>/dev/null | jq -r '.created // empty' | cut -dT -f1)"
+            [ -z "$created" ] && continue
+            # keep if created >= cutoff (awk does the ISO-date compare portably)
+            if awk -v a="$created" -v b="$cutoff" 'BEGIN{exit !(a>=b)}'; then
+              active="$active $tip"; echo "  active line ${m}: ${tip} (image ${created} >= ${cutoff})"
+            fi
+          done
+          # maintained-to-build = active line tips UNION the latest release, deduped
+          recent="$(printf '%s\n' $active "$latest" | grep -E "$SEMVER" | sort -uV | uniq || true)"
+          echo "discovery (active within ${ACTIVITY_DAYS}d + latest=${latest}):"
+          printf '%s\n' "$recent" | sed 's/^/  /'
 
           build_set=""
           for v in $recent; do
