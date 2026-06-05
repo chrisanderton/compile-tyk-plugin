@@ -34,6 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       go_version: ${{ steps.r.outputs.GO_VERSION }}
+      gateway_trimpath: ${{ steps.r.outputs.GATEWAY_TRIMPATH }}
       github_sha: ${{ steps.r.outputs.GITHUB_SHA }}
       github_tag: ${{ steps.r.outputs.GITHUB_TAG }}
       sha_amd64:  ${{ steps.r.outputs.GO_SHA256_amd64 }}
@@ -195,6 +196,7 @@ jobs:
           build-args: |
             BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi@${{ needs.base.outputs.digest }}
             GO_VERSION=${{ needs.resolve.outputs.go_version }}
+            GATEWAY_TRIMPATH=${{ needs.resolve.outputs.gateway_trimpath }}
             GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
             GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
             GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}

@@ -68,6 +68,15 @@ fetch_gw_binary "$GW" "$TMP" || { echo "ERROR: could not fetch gateway binary fr
 GO_VERSION="$(go version "$TMP/opt/tyk-gateway/tyk" | awk '{print $2}')"   # e.g. go1.25.10
 [ -n "$GO_VERSION" ] || { echo "ERROR: could not read Go version from gateway binary" >&2; exit 1; }
 
+# 2b. -trimpath: a plugin MUST match the Gateway's -trimpath setting or plugin.Open rejects
+# it ("plugin was built with a different version of package ...") - shared-package build IDs
+# (incl. stdlib) differ between trimmed and untrimmed builds. Newer Go (>=1.18) records the
+# flag in the binary; OLDER Go (<1.18, e.g. v5.0.x on go1.16) does NOT and those Gateways were
+# built WITHOUT -trimpath (proven by load test). So: true only if the binary explicitly records
+# it, else false. build.sh adds -trimpath iff this is true.
+GATEWAY_TRIMPATH=false
+go version -m "$TMP/opt/tyk-gateway/tyk" 2>/dev/null | grep -qE 'trimpath=true' && GATEWAY_TRIMPATH=true
+
 # 3. Official Go tarball checksums for that exact version (no hardcoding).
 GODL="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all')" || { echo "ERROR: fetching go.dev release index failed" >&2; exit 1; }
 sha_for() { echo "$GODL" | jq -r --arg v "$GO_VERSION" --arg a "$1" \
@@ -129,6 +138,7 @@ emit GATEWAY_VERSION "$VER"
 emit GITHUB_TAG      "$VER"
 emit GITHUB_SHA      "$SHA"
 emit GO_VERSION      "$GO_VERSION"
+emit GATEWAY_TRIMPATH "$GATEWAY_TRIMPATH"
 emit GO_SHA256_amd64 "$GO_SHA256_amd64"
 emit GO_SHA256_arm64 "$GO_SHA256_arm64"
 emit GO_SHA256_s390x "$GO_SHA256_s390x"

@@ -48,10 +48,14 @@ ARG GITHUB_SHA
 ARG GITHUB_TAG
 ARG BUILD_TAG
 ARG GOFIPS140
+# Whether the Gateway was built with -trimpath (derived from its binary). build.sh matches it
+# so plugin.Open accepts the plugin; older Gateways (go1.16, e.g. v5.0.x) were built without it.
+ARG GATEWAY_TRIMPATH=true
 ENV GITHUB_SHA=${GITHUB_SHA} \
     GITHUB_TAG=${GITHUB_TAG} \
     BUILD_TAG=${BUILD_TAG} \
-    GOFIPS140=${GOFIPS140}
+    GOFIPS140=${GOFIPS140} \
+    TYK_GATEWAY_TRIMPATH=${GATEWAY_TRIMPATH}
 
 # --- Per-edition settings for THIS release (resolved from the edition Gateways) ---
 # Baked so users select the edition at use time: `-e EDITION=ce|ee|ee-fips`

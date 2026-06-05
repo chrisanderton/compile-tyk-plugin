@@ -283,8 +283,15 @@ fi
 ldflags_args=()
 [ -n "$EXTLDFLAGS" ] && ldflags_args=(-ldflags "-extldflags '$EXTLDFLAGS'")
 
+# Match the Gateway's -trimpath: a plugin built with a DIFFERENT -trimpath setting than the
+# Gateway fails plugin.Open ("different version of package <stdlib>"), because shared-package
+# build IDs differ between trimmed and untrimmed builds. TYK_GATEWAY_TRIMPATH is derived from
+# the Gateway binary (resolve-gateway.sh); default true preserves the modern behaviour if unset.
+trimpath_args=()
+[ "${TYK_GATEWAY_TRIMPATH:-true}" = "true" ] && trimpath_args=(-trimpath)
+
 CC="$CC" CGO_ENABLED=1 GOOS="$GOOS" GOARCH="$GOARCH" \
-	go build -buildmode=plugin -trimpath -tags=goplugin${BUILD_TAG:+,$BUILD_TAG} \
+	go build -buildmode=plugin "${trimpath_args[@]}" -tags=goplugin${BUILD_TAG:+,$BUILD_TAG} \
 	"${ldflags_args[@]}" -o "$plugin_name"
 
 set +x
