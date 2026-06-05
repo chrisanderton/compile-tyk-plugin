@@ -47,7 +47,7 @@ Same interface as the official compiler - only the image name changes.
 | 3 | `GOOS` | optional; default `linux` |
 | 4 | `GOARCH` | optional; default = host arch |
 
-### Environment knobs
+### Environment variables
 - **Edition:** `EDITION=ce` (default) `| ee | ee-fips` (`FIPS=1` = alias for `ee-fips`).
 - **Target arch:** `GOARCH=amd64|arm64|s390x` (or positional arg 4).
 - Preserved from the official compiler: `PLUGIN_SOURCE_PATH`, `PLUGIN_BUILD_PATH`,
