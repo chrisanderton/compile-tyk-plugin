@@ -27,19 +27,31 @@ archs_of() {
 }
 
 # Extract /opt/tyk-gateway/tyk from an image WITHOUT pulling the whole image. The binary
-# lives in one layer (the COPY /opt/tyk-gateway layer, by far the largest), so pull layers
-# largest-first and stop at the one that has it. Writes <dest>/opt/tyk-gateway/tyk and
+# lives in one large layer (direct COPY in newer images, package install in older images),
+# so pull layers largest-first and stop at the one that has it. Writes <dest>/opt/tyk-gateway/tyk and
 # returns non-zero if no layer yields it. (crane export would stream every layer instead.)
 fetch_gw_binary() {
-  local ref="$1" dest="$2" repo man layers d
+  local ref="$1" dest="$2" repo man cfg layers d media tar_flags
   repo="${ref%:*}"                                  # repo without :tag, for blob refs
   man="$(crane manifest --platform linux/amd64 "$ref" 2>/dev/null)" || return 1
-  layers="$(echo "$man" | jq -r '.layers // [] | sort_by(-.size) | .[].digest' 2>/dev/null)" || return 1
+  cfg="$(crane config --platform linux/amd64 "$ref" 2>/dev/null || printf '{}')"
+  layers="$(echo "$man" | jq -r --argjson cfg "$cfg" '
+    ($cfg.history // [] | map(select(.empty_layer != true))) as $history
+    | [.layers // [] | to_entries[] | .value + {
+        rank: (if (($history[.key].created_by // "") | test("COPY .*?/opt/tyk-gateway|dpkg -i .*tyk-gateway"; "i")) then 0 else 1 end)
+      }]
+    | sort_by(.rank, -(.size // 0))
+    | .[] | [.digest, .mediaType] | @tsv
+  ' 2>/dev/null)" || return 1
   [ -n "$layers" ] || return 1
-  for d in $layers; do
-    crane blob "${repo}@${d}" 2>/dev/null | tar -xf - -C "$dest" opt/tyk-gateway/tyk 2>/dev/null || true
+  while IFS=$'\t' read -r d media; do
+    case "$media" in
+      *gzip*) tar_flags="-xzf" ;;
+      *)      tar_flags="-xf" ;;
+    esac
+    crane blob "${repo}@${d}" 2>/dev/null | tar "$tar_flags" - -C "$dest" opt/tyk-gateway/tyk 2>/dev/null || true
     [ -s "$dest/opt/tyk-gateway/tyk" ] && return 0
-  done
+  done <<< "$layers"
   return 1
 }
 
