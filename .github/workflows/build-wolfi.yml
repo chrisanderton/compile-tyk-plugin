@@ -167,6 +167,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      - uses: actions/checkout@v5            # this repo: provides Dockerfile.release
       - name: Checkout Gateway source @ release commit
         uses: actions/checkout@v5
         with:
