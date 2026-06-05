@@ -71,6 +71,7 @@ esac
 command -v "$GNU_CC" >/dev/null 2>&1 || GNU_CC=$(go env CC)
 
 CC="$GNU_CC"
+EXTLDFLAGS=""
 if [[ "$GOOS" == "linux" ]]; then
   if [ -d "$SYSROOT/usr/lib" ]; then
     # Pin libc/crt/headers to glibc ${TYK_GLIBC_TARGET} via the sysroot:
@@ -80,7 +81,17 @@ if [[ "$GOOS" == "linux" ]]; then
     #   -isystem       : libc headers
     #   --dynamic-linker: keep the interp path identical to the Gateway image
     CC="$GNU_CC --sysroot=$SYSROOT -B$SYSROOT/usr/lib -isystem $SYSROOT/usr/include"
-    [ -n "$DYNLD" ] && CC="$CC -Wl,--dynamic-linker=$DYNLD"
+    # The EXTERNAL LINK must get the sysroot too. Modern Go threads CC's flags into the
+    # cgo link, but OLD Go (<1.18, e.g. building for v5.0.x on go1.16) takes only the
+    # compiler BINARY from CC for -extld and DROPS the flags - so the plugin links against
+    # the base glibc (observed: GLIBC_2.34, libpthread merged into libc) instead of the
+    # 2.31 sysroot. Passing the same flags via -extldflags pins the link for ALL Go
+    # versions (redundant but harmless on modern Go; essential on old Go).
+    EXTLDFLAGS="--sysroot=$SYSROOT -B$SYSROOT/usr/lib"
+    if [ -n "$DYNLD" ]; then
+      CC="$CC -Wl,--dynamic-linker=$DYNLD"
+      EXTLDFLAGS="$EXTLDFLAGS -Wl,--dynamic-linker=$DYNLD"
+    fi
     echo "INFO: target linux/$GOARCH  CC='$CC'  (glibc<=$TYK_GLIBC_TARGET, host $HOST_ARCH)"
   else
     # No baked toolchain/sysroot for this linux arch. The set of supported target
@@ -267,8 +278,14 @@ if [[ "$DEBUG" == "1" ]] ; then
 	git diff --cached
 fi
 
+# Pass the sysroot to the external linker via -extldflags (see EXTLDFLAGS above - this is
+# what makes OLD Go honor the glibc-2.31 sysroot at link time, not just at compile time).
+ldflags_args=()
+[ -n "$EXTLDFLAGS" ] && ldflags_args=(-ldflags "-extldflags '$EXTLDFLAGS'")
+
 CC="$CC" CGO_ENABLED=1 GOOS="$GOOS" GOARCH="$GOARCH" \
-	go build -buildmode=plugin -trimpath -tags=goplugin${BUILD_TAG:+,$BUILD_TAG} -o "$plugin_name"
+	go build -buildmode=plugin -trimpath -tags=goplugin${BUILD_TAG:+,$BUILD_TAG} \
+	"${ldflags_args[@]}" -o "$plugin_name"
 
 set +x
 
