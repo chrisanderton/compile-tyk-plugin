@@ -56,6 +56,7 @@ jobs:
       wolfi_digest: ${{ steps.wd.outputs.digest }}
       date:  ${{ steps.meta.outputs.date }}
       dh_ns: ${{ steps.meta.outputs.dh_ns }}
+      glibc_suffix: ${{ steps.meta.outputs.glibc_suffix }}
     steps:
       - uses: actions/checkout@v5
       - name: Check required config
@@ -107,6 +108,10 @@ jobs:
         run: |
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
           echo "dh_ns=${{ vars.DOCKERHUB_USER }}" >> "$GITHUB_OUTPUT"
+          # Non-default glibc floors get a tag + buildcache suffix so a 2.31 build never
+          # overwrites the canonical 2.17 default images (empty => 2.17, untouched).
+          g="${{ inputs.glibc_target }}"; g="${g:-2.17}"
+          if [ "$g" = "2.17" ]; then echo "glibc_suffix=" >> "$GITHUB_OUTPUT"; else echo "glibc_suffix=-glibc$g" >> "$GITHUB_OUTPUT"; fi
 
   base:
     needs: resolve
@@ -136,12 +141,13 @@ jobs:
         env:
           PUSH: ${{ inputs.push }}
           DH_NS: ${{ needs.resolve.outputs.dh_ns }}
+          SFX: ${{ needs.resolve.outputs.glibc_suffix }}
         run: |
           {
             echo "tags<<EOF"
-            echo "ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi:latest"
+            echo "ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi:latest${SFX}"
             if [ "$PUSH" = "true" ]; then
-              echo "docker.io/${DH_NS}/${IMAGE_NAME}-base-wolfi:latest"
+              echo "docker.io/${DH_NS}/${IMAGE_NAME}-base-wolfi:latest${SFX}"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -157,8 +163,8 @@ jobs:
             DHI_DIGEST=${{ needs.resolve.outputs.wolfi_digest }}
             GLIBC_TARGET=${{ inputs.glibc_target || '2.17' }}
           tags: ${{ steps.basetags.outputs.tags }}
-          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache,mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache${{ needs.resolve.outputs.glibc_suffix }}
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache${{ needs.resolve.outputs.glibc_suffix }},mode=max
 
   # Build the Wolfi compiler ONCE per arch (edition-agnostic), push to GHCR by digest.
   # Native amd64/arm64 only - Wolfi has no cross toolchain. Reused by gate + publish.
@@ -215,8 +221,8 @@ jobs:
             CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
             EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
             FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
-          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }},mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }}${{ needs.resolve.outputs.glibc_suffix }}
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-wolfi-${{ matrix.arch }}${{ needs.resolve.outputs.glibc_suffix }},mode=max
       - name: Export per-arch digest
         run: |
           mkdir -p /tmp/digest
@@ -283,10 +289,13 @@ jobs:
           DH_IMG: docker.io/${{ needs.resolve.outputs.dh_ns }}/${{ env.IMAGE_NAME }}
           TAG: ${{ needs.resolve.outputs.github_tag }}
           DATE: ${{ needs.resolve.outputs.date }}
+          SFX: ${{ needs.resolve.outputs.glibc_suffix }}
         run: |
           AMD="$(cat /tmp/digest/amd64)"
           ARM="$(cat /tmp/digest/arm64)"
+          # ${SFX} keeps an opt-in 2.31 build on its own tags (e.g. :v5.13.0-wolfi-glibc2.31),
+          # never overwriting the 2.17 default (:v5.13.0-wolfi). Empty for 2.17.
           docker buildx imagetools create \
-            -t "${GHCR_IMG}:${TAG}-wolfi" -t "${GHCR_IMG}:${TAG}-wolfi-${DATE}" \
-            -t "${DH_IMG}:${TAG}-wolfi"   -t "${DH_IMG}:${TAG}-wolfi-${DATE}" \
+            -t "${GHCR_IMG}:${TAG}-wolfi${SFX}" -t "${GHCR_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
+            -t "${DH_IMG}:${TAG}-wolfi${SFX}"   -t "${DH_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
             "${GHCR_IMG}@${AMD}" "${GHCR_IMG}@${ARM}"
