@@ -16,7 +16,7 @@ reduction is structural rather than cosmetic.
 
 "Release builder" = the official `tyk-plugin-compiler@sha256:ce908f76...` (a
 goreleaser-cross image that also builds and packages the Gateway). "This image" =
-`debian:trixie-slim` + a glibc-2.31 link sysroot (the DHI base gives comparable
+`debian:trixie-slim` + a glibc-2.17 link sysroot (the DHI base gives comparable
 numbers - see `docs/base-images.md`). \*Wolfi = `cgr.dev/chainguard/wolfi-base` (measured:
 no perl in the base even after installing gcc 16.1 + glibc-dev - see below). A
 package-count comparison is not strictly apples-to-apples, since the release builder
@@ -84,7 +84,7 @@ build input) and running an old distro as the OS (a broader, system-wide surface
   These are unavoidable - the plugin **must** be built with the Gateway's exact Go
   version (ABI requirement). They are identical to the Gateway's own exposure.
 - **trixie base + gcc/binutils + cross gcc**: the irreducible compile toolchain.
-- **glibc-2.31 sysroot files**: build inputs (see above).
+- **glibc-2.17 sysroot files**: build inputs (see above).
 
 ## Further hardening (documented, not yet applied)
 

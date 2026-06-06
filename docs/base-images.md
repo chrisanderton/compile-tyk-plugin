@@ -47,10 +47,14 @@ arm64.
 
 ## The glibc floor is the same on both
 
-Whichever base you use, every plugin is linked against a glibc-2.31 sysroot baked into
-the image, independent of the base's own glibc. This keeps the plugin's required glibc
-symbols low (and therefore loadable on the Gateway runtime) regardless of which base
-produced it. See `docs/compatibility.md` for measured ceilings.
+Whichever base you use, every plugin is linked against a glibc-2.17 sysroot (the RHEL 7 /
+CentOS 7 ABI, from `manylinux2014`) baked into the image, independent of the base's own
+glibc. This keeps the plugin's required glibc symbols low - loadable on the Gateway runtime
+*and* on older native hosts like RHEL 7 - regardless of which base produced it. The floor
+is selectable with `--build-arg GLIBC_TARGET=2.17|2.31` (2.17 default; 2.31 is an opt-in
+for plugins needing a newer glibc function, and is not RHEL 7 compatible). See
+`docs/compatibility.md` for measured ceilings and `data/sysroot-2.17-digests.txt` for the
+pinned 2.17 sources and the arches they cover.
 
 ## Using a different base
 

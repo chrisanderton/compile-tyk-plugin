@@ -77,6 +77,22 @@ GO_VERSION="$(go version "$TMP/opt/tyk-gateway/tyk" | awk '{print $2}')"   # e.g
 GATEWAY_TRIMPATH=false
 go version -m "$TMP/opt/tyk-gateway/tyk" 2>/dev/null | grep -qE 'trimpath=true' && GATEWAY_TRIMPATH=true
 
+# 2c. GOPATH src root: a GOPATH-built Gateway (Go<1.18, GO111MODULE=off, untrimmed) bakes each
+# shared package's source path as <src-root>/<importpath> (e.g. /go/src/github.com/google/uuid/..).
+# A module-mode plugin builds the same code from /go/pkg/mod/<path>@<ver>, so plugin.Open rejects
+# it ("different version of package <dep>") even when the VERSION matches. Detect that root so
+# build.sh can mirror the GOPATH layout (method=gopath). Only meaningful when untrimmed: a trimmed
+# binary has no paths; a module-mode untrimmed binary has /pkg/mod/ paths (no /src/ match -> empty,
+# so build.sh keeps the workspace/replace method).
+GATEWAY_SRC_ROOT=""
+if [ "$GATEWAY_TRIMPATH" = "false" ]; then
+  # || true: head closing the pipe early SIGPIPEs strings; under pipefail+set -e that would
+  # otherwise abort the whole resolve (same guard the FIPS greps use).
+  GATEWAY_SRC_ROOT="$( { strings "$TMP/opt/tyk-gateway/tyk" 2>/dev/null \
+    | grep -oE '/[^[:space:]]*/src/github\.com/[^[:space:]]+\.go' | head -1 \
+    | sed -E 's#(/.*/src)/github\.com/.*#\1#'; } || true )"
+fi
+
 # 3. Official Go tarball checksums for that exact version (no hardcoding).
 GODL="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all')" || { echo "ERROR: fetching go.dev release index failed" >&2; exit 1; }
 sha_for() { echo "$GODL" | jq -r --arg v "$GO_VERSION" --arg a "$1" \
@@ -139,6 +155,7 @@ emit GITHUB_TAG      "$VER"
 emit GITHUB_SHA      "$SHA"
 emit GO_VERSION      "$GO_VERSION"
 emit GATEWAY_TRIMPATH "$GATEWAY_TRIMPATH"
+emit GATEWAY_SRC_ROOT "$GATEWAY_SRC_ROOT"
 emit GO_SHA256_amd64 "$GO_SHA256_amd64"
 emit GO_SHA256_arm64 "$GO_SHA256_arm64"
 emit GO_SHA256_s390x "$GO_SHA256_s390x"

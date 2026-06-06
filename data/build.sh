@@ -3,7 +3,7 @@
 # v5.13.0 build.sh. Same positional args, env vars, output naming and
 # /plugin-source behaviour. Additions are opt-out and do not change defaults:
 #
-#   * CC + --sysroot are selected from the pinned glibc-2.31 link sysroots so
+#   * CC + --sysroot are selected from the pinned glibc link sysroots (2.17 default) so
 #     generated plugins keep the SAME low GLIBC symbol floor as the old image
 #     regardless of the (modern) base OS glibc.
 #   * After a successful build the artifact is validated and the build FAILS
@@ -56,7 +56,7 @@ if [ -z "$plugin_name" ] ; then
 fi
 
 # --- CC + sysroot selection -------------------------------------------------
-# Pick the C compiler and the matching glibc-2.31 sysroot for the TARGET arch.
+# Pick the C compiler and the matching glibc sysroot for the TARGET arch.
 # Works whether the build host is amd64 or arm64 (native preferred, cross OK).
 HOST_ARCH=$(go env GOHOSTARCH)
 SYSROOT="${TYK_PLUGIN_SYSROOT_BASE}/linux-${GOARCH}-glibc-${TYK_GLIBC_TARGET}"
@@ -76,16 +76,20 @@ if [[ "$GOOS" == "linux" ]]; then
   if [ -d "$SYSROOT/usr/lib" ]; then
     # Pin libc/crt/headers to glibc ${TYK_GLIBC_TARGET} via the sysroot:
     #   --sysroot      : libc.so script + headers resolution
-    #   -B .../usr/lib : pick crt1.o/crti.o/crtn.o from the 2.31 sysroot
+    #   -B .../usr/lib : pick crt1.o/crti.o/crtn.o from the sysroot
     #                    (gcc support objects still come from the compiling gcc)
     #   -isystem       : libc headers
     #   --dynamic-linker: keep the interp path identical to the Gateway image
+    # NOTE: OLD Go (<1.18, e.g. v5.0.x on go1.16) links -buildmode=plugin for the NATIVE
+    # target arch via the GOLD linker (-fuse-ld=gold); the base image therefore ships
+    # binutils-gold, else the external link dies "collect2: cannot find 'ld'" (it is
+    # looking for ld.gold). Cross targets use bfd ld and are unaffected; modern Go uses bfd.
     CC="$GNU_CC --sysroot=$SYSROOT -B$SYSROOT/usr/lib -isystem $SYSROOT/usr/include"
     # The EXTERNAL LINK must get the sysroot too. Modern Go threads CC's flags into the
     # cgo link, but OLD Go (<1.18, e.g. building for v5.0.x on go1.16) takes only the
     # compiler BINARY from CC for -extld and DROPS the flags - so the plugin links against
     # the base glibc (observed: GLIBC_2.34, libpthread merged into libc) instead of the
-    # 2.31 sysroot. Passing the same flags via -extldflags pins the link for ALL Go
+    # sysroot. Passing the same flags via -extldflags pins the link for ALL Go
     # versions (redundant but harmless on modern Go; essential on old Go).
     EXTLDFLAGS="--sysroot=$SYSROOT -B$SYSROOT/usr/lib"
     if [ -n "$DYNLD" ]; then
@@ -179,25 +183,59 @@ if [ -n "$GW_GO_MM" ] && [ -f go.mod ]; then
 fi
 
 # Force the plugin to build against the EXACT vendored Gateway source + dependency
-# graph - the core of Go plugin ABI compatibility. Two methods, same outcome:
+# graph - the core of Go plugin ABI compatibility. Three methods, same outcome:
 #   * workspace (default, Go >= 1.18): a go.work makes ./tyk authoritative.
-#   * replace   (Go < 1.18, no workspaces - e.g. building for v5.0.x on go1.16):
-#               point tyk at ./tyk via a replace directive AND mirror the Gateway's
-#               OWN replace directives, so shared transitive deps resolve identically
-#               (replaces apply only to the main module, so the plugin must repeat them).
-# PLUGIN_BUILD_METHOD = auto | workspace | replace  (default auto -> chosen by Go version).
-# The default route is workspace; the replace path exists for legacy ad-hoc builds and
+#   * replace   (Go < 1.18, module-mode Gateway): point tyk at ./tyk via a replace directive
+#               AND mirror the Gateway's OWN replace directives, so shared transitive deps
+#               resolve identically (replaces apply only to the main module, so the plugin
+#               must repeat them).
+#   * gopath    (Go < 1.18, GOPATH-mode Gateway - e.g. v5.0.x built GO111MODULE=off):
+#               an UNTRIMMED GOPATH Gateway bakes each shared package's source PATH
+#               (/go/src/<importpath>) into its build ID. A module-mode plugin builds the
+#               same code from /go/pkg/mod/<path>@<ver>, so plugin.Open rejects it
+#               ("different version of package <dep>") even when the VERSION matches. The fix
+#               is to reproduce the Gateway's GOPATH layout: mirror its whole module graph as
+#               symlinks under <src-root>/<importpath> and build GO111MODULE=off. Selected
+#               automatically when resolve-gateway.sh detected TYK_GATEWAY_SRC_ROOT.
+# PLUGIN_BUILD_METHOD = auto | workspace | replace | gopath (default auto).
+# The default route is workspace; replace/gopath exist for legacy ad-hoc builds and
 # will be retired when pre-1.18 Gateways are no longer supported.
 GO_MINOR="$(go env GOVERSION 2>/dev/null | sed -E 's/^go[0-9]+\.([0-9]+).*/\1/')"
 PLUGIN_BUILD_METHOD="${PLUGIN_BUILD_METHOD:-auto}"
 case "$PLUGIN_BUILD_METHOD" in
-	workspace) USE_WS=1 ;;
-	replace)   USE_WS=0 ;;
-	auto)      USE_WS=1; [ "${GO_MINOR:-0}" -ge 18 ] 2>/dev/null || USE_WS=0 ;;
-	*) echo "ERROR: PLUGIN_BUILD_METHOD must be auto|workspace|replace (got '$PLUGIN_BUILD_METHOD')" >&2; exit 1 ;;
+	workspace|replace|gopath) METHOD="$PLUGIN_BUILD_METHOD" ;;
+	auto)
+		if [ -n "${TYK_GATEWAY_SRC_ROOT:-}" ]; then METHOD=gopath
+		elif [ "${GO_MINOR:-0}" -ge 18 ] 2>/dev/null; then METHOD=workspace
+		else METHOD=replace; fi ;;
+	*) echo "ERROR: PLUGIN_BUILD_METHOD must be auto|workspace|replace|gopath (got '$PLUGIN_BUILD_METHOD')" >&2; exit 1 ;;
 esac
 
-if [ "$USE_WS" = "1" ]; then
+# Mirror the Gateway's module graph into GOPATH/src layout (symlinks), so shared packages
+# build from the same <src-root>/<importpath> the GOPATH-built Gateway baked into its IDs.
+layout_gopath() {
+	local SR="${TYK_GATEWAY_SRC_ROOT:?gopath method needs TYK_GATEWAY_SRC_ROOT}"
+	echo "INFO: downloading Gateway module graph for GOPATH layout under $SR ..."
+	( cd "$TYK_GW_PATH" && GO111MODULE=on go mod download all ) 2>&1 | grep -v '^go: downloading' || true
+	( cd "$TYK_GW_PATH" && GO111MODULE=on go list -m -json all 2>/dev/null ) \
+		| jq -c 'select(.Main != true and ((.Replace.Dir // .Dir) != null))' \
+		| while read -r m; do
+			p="$(echo "$m" | jq -r '.Path')"
+			d="$(echo "$m" | jq -r '.Replace.Dir // .Dir')"
+			dest="$SR/$p"
+			[ -e "$dest" ] && continue
+			mkdir -p "$(dirname "$dest")"
+			ln -s "$d" "$dest"
+		done
+}
+
+GO111MODULE_BUILD=on
+if [ "$METHOD" = "gopath" ]; then
+	echo "INFO: dependency-alignment method=gopath (Go 1.${GO_MINOR:-?}, GOPATH-built Gateway)"
+	layout_gopath
+	GO111MODULE_BUILD=off
+	cd "$PLUGIN_BUILD_PATH"
+elif [ "$METHOD" = "workspace" ]; then
 	echo "INFO: dependency-alignment method=workspace (Go 1.${GO_MINOR:-?})"
 	cd "$WORKSPACE_ROOT"
 	go work init ./tyk
@@ -279,7 +317,7 @@ if [[ "$DEBUG" == "1" ]] ; then
 fi
 
 # Pass the sysroot to the external linker via -extldflags (see EXTLDFLAGS above - this is
-# what makes OLD Go honor the glibc-2.31 sysroot at link time, not just at compile time).
+# what makes OLD Go honor the glibc sysroot at link time, not just at compile time).
 ldflags_args=()
 [ -n "$EXTLDFLAGS" ] && ldflags_args=(-ldflags "-extldflags '$EXTLDFLAGS'")
 
@@ -287,10 +325,15 @@ ldflags_args=()
 # Gateway fails plugin.Open ("different version of package <stdlib>"), because shared-package
 # build IDs differ between trimmed and untrimmed builds. TYK_GATEWAY_TRIMPATH is derived from
 # the Gateway binary (resolve-gateway.sh); default true preserves the modern behaviour if unset.
+# PLUGIN_TRIMPATH (runtime) OVERRIDES the derived value - needed only if the gate reveals a
+# go<1.18 Gateway that actually used -trimpath (older Go does not record the flag, so such
+# Gateways are derived as no-trimpath; this lets you force the other way without a rebuild).
+TRIMPATH="${PLUGIN_TRIMPATH:-${TYK_GATEWAY_TRIMPATH:-true}}"
 trimpath_args=()
-[ "${TYK_GATEWAY_TRIMPATH:-true}" = "true" ] && trimpath_args=(-trimpath)
+[ "$TRIMPATH" = "true" ] && trimpath_args=(-trimpath)
+echo "INFO: -trimpath=$TRIMPATH (derived=${TYK_GATEWAY_TRIMPATH:-unset}${PLUGIN_TRIMPATH:+, override PLUGIN_TRIMPATH=$PLUGIN_TRIMPATH})"
 
-CC="$CC" CGO_ENABLED=1 GOOS="$GOOS" GOARCH="$GOARCH" \
+CC="$CC" CGO_ENABLED=1 GOOS="$GOOS" GOARCH="$GOARCH" GO111MODULE="${GO111MODULE_BUILD:-on}" \
 	go build -buildmode=plugin "${trimpath_args[@]}" -tags=goplugin${BUILD_TAG:+,$BUILD_TAG} \
 	"${ldflags_args[@]}" -o "$plugin_name"
 

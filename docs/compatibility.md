@@ -24,21 +24,34 @@ so the ABI match is identical to the official compiler's.
 | Build tags / flags | `-trimpath`, edition tags, `-buildmode=plugin` | same tags | yes |
 | CGO | enabled | enabled | yes |
 | Dynamic linker | pinned per arch | same | yes |
-| glibc symbol floor | <= 2.31 (see below) | provides 2.41 | yes, with headroom |
+| glibc symbol floor | <= 2.17 (see below) | provides 2.41 | yes, far below |
 
 ## glibc floor
 
 A binary that requires glibc symbols up to version *N* loads on any glibc *>= N*. The
 Gateway runtime ships glibc 2.41, so a plugin loads as long as its highest required
-symbol is <= 2.41. This compiler links every plugin against a glibc-2.31 sysroot, which
-holds the floor about ten minor versions below the runtime. The result is maximum
-portability at no behavioral cost. Measured ceilings per target:
+symbol is <= 2.41 - but the runtime is not the only constraint. Customers also run the
+Gateway **natively on older OSes** (notably RHEL 7, glibc 2.17, in Extended Life Cycle
+Support), and a plugin must load there too.
+
+So this compiler links every plugin against a **glibc-2.17 sysroot by default** - the
+RHEL 7 / CentOS 7 ABI, sourced from the `manylinux2014` images. That is also the glibc
+the Gateway's own cgo is linked against (its binaries require <= 2.16), so the plugin
+floor simply matches the Gateway. The result is a plugin that loads on everything from
+RHEL 7 upward, at no behavioral cost. Measured ceilings per target (2.17 sysroot):
 
 | Target | Highest required glibc symbol |
 |---|---|
-| linux/amd64 | 2.3.2 |
-| linux/arm64 | 2.17 |
-| linux/s390x | 2.4 |
+| linux/amd64 | 2.3.2 (measured) |
+| linux/arm64 | <= 2.17 |
+| linux/s390x | <= 2.17 |
+
+### Opting into a higher floor (2.31)
+
+If a plugin's C code calls a glibc function only added between 2.18 and 2.31, build the
+base with `GLIBC_TARGET=2.31` (Debian bullseye sysroot) - or pass `glibc_target: "2.31"`
+to the build workflow. Those plugins then require glibc >= 2.31 at the destination and
+will **not** load on RHEL 7. Stay on the 2.17 default unless you have that specific need.
 
 ## Tested load matrix (v5.13.0)
 

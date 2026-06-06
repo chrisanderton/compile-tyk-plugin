@@ -19,7 +19,8 @@ What it gives you:
 - **One image, many targets** - cross-compiles amd64/arm64/s390x and builds for the
   **CE / EE / EE-FIPS** editions, all selected with a flag.
 - **Old-glibc CGO compatibility as an isolated link sysroot** - plugins link against a
-  pinned glibc for compatibility while the image itself stays modern and small.
+  pinned glibc-2.17 floor (RHEL 7 / CentOS 7 ABI; `GLIBC_TARGET=2.31` to opt up) for
+  broad portability, while the image itself stays modern and small.
 
 It is purpose-built for compiling plugins. The official `tyk-plugin-compiler` is a
 general-purpose Gateway release builder that does more than compile plugins, so a direct

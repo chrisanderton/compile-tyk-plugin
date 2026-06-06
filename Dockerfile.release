@@ -51,11 +51,16 @@ ARG GOFIPS140
 # Whether the Gateway was built with -trimpath (derived from its binary). build.sh matches it
 # so plugin.Open accepts the plugin; older Gateways (go1.16, e.g. v5.0.x) were built without it.
 ARG GATEWAY_TRIMPATH=true
+# Non-empty only for a GOPATH-built (Go<1.18, untrimmed) Gateway; build.sh then mirrors the
+# Gateway's module graph into this src root and builds GO111MODULE=off so plugin.Open's
+# per-package build IDs match. Empty -> workspace/replace method. See scripts/resolve-gateway.sh.
+ARG GATEWAY_SRC_ROOT=
 ENV GITHUB_SHA=${GITHUB_SHA} \
     GITHUB_TAG=${GITHUB_TAG} \
     BUILD_TAG=${BUILD_TAG} \
     GOFIPS140=${GOFIPS140} \
-    TYK_GATEWAY_TRIMPATH=${GATEWAY_TRIMPATH}
+    TYK_GATEWAY_TRIMPATH=${GATEWAY_TRIMPATH} \
+    TYK_GATEWAY_SRC_ROOT=${GATEWAY_SRC_ROOT}
 
 # --- Per-edition settings for THIS release (resolved from the edition Gateways) ---
 # Baked so users select the edition at use time: `-e EDITION=ce|ee|ee-fips`
@@ -92,7 +97,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     else echo "skipping gateway self-test binary (WITH_GATEWAY_SELFTEST=0)"; fi
 
 LABEL org.opencontainers.image.title="compile-tyk-plugin" \
-      org.opencontainers.image.description="Community/unofficial modern low-CVE compiler for Tyk Go plugins (DHI base, glibc-2.31 sysroot). Not affiliated with Tyk." \
+      org.opencontainers.image.description="Community/unofficial modern low-CVE compiler for Tyk Go plugins (DHI base, glibc-2.17 sysroot). Not affiliated with Tyk." \
       org.opencontainers.image.source="https://github.com/TykTechnologies/tyk" \
       org.opencontainers.image.version="${GITHUB_TAG}" \
       org.opencontainers.image.revision="${GITHUB_SHA}" \

@@ -13,10 +13,12 @@ on:
     inputs:
       gateway_version: { description: "Gateway version, e.g. v5.13.0", required: true, type: string }
       push:           { description: "Push to registries", required: false, type: boolean, default: true }
+      glibc_target:   { description: "Plugin glibc floor: 2.17 (RHEL 7+, default) or 2.31", required: false, type: string, default: "2.17" }
   workflow_call:
     inputs:
       gateway_version: { required: true, type: string }
       push:           { required: false, type: boolean, default: true }
+      glibc_target:   { required: false, type: string, default: "2.17" }
     secrets:
       DOCKERHUB_TOKEN: { required: true }
 
@@ -35,6 +37,7 @@ jobs:
     outputs:
       go_version: ${{ steps.r.outputs.GO_VERSION }}
       gateway_trimpath: ${{ steps.r.outputs.GATEWAY_TRIMPATH }}
+      gateway_src_root: ${{ steps.r.outputs.GATEWAY_SRC_ROOT }}
       github_sha: ${{ steps.r.outputs.GITHUB_SHA }}
       github_tag: ${{ steps.r.outputs.GITHUB_TAG }}
       sha_amd64:  ${{ steps.r.outputs.GO_SHA256_amd64 }}
@@ -152,6 +155,7 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ env.WOLFI_BASE }}@${{ needs.resolve.outputs.wolfi_digest }}
             DHI_DIGEST=${{ needs.resolve.outputs.wolfi_digest }}
+            GLIBC_TARGET=${{ inputs.glibc_target || '2.17' }}
           tags: ${{ steps.basetags.outputs.tags }}
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache,mode=max
@@ -197,6 +201,7 @@ jobs:
             BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi@${{ needs.base.outputs.digest }}
             GO_VERSION=${{ needs.resolve.outputs.go_version }}
             GATEWAY_TRIMPATH=${{ needs.resolve.outputs.gateway_trimpath }}
+            GATEWAY_SRC_ROOT=${{ needs.resolve.outputs.gateway_src_root }}
             GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
             GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
             GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}

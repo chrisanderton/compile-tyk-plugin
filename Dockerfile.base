@@ -3,7 +3,7 @@
 # tyk-plugin-compiler-BASE - the STABLE layer (slow cadence).
 # Contains everything that does NOT change per Gateway release:
 #   modern hardened base (DHI), C toolchains (native + amd64/arm64/s390x cross),
-#   glibc-2.31 link sysroots, build.sh, validate-plugin.sh, env.
+#   glibc link sysroots (2.17 default), build.sh, validate-plugin.sh, env.
 # It deliberately ships NO Go toolchain and NO Gateway source - those are
 # release-specific and added by Dockerfile.release on top of this image.
 #
@@ -11,16 +11,21 @@
 # (e.g. a DHI CVE patch) - NOT on every Gateway release. See docs/sustainability.md.
 
 ARG SYSROOT_SUITE=bullseye
-ARG GLIBC_TARGET=2.31
+# glibc link floor. 2.17 (DEFAULT) = RHEL 7 / CentOS 7, from manylinux2014 - maximally
+# portable (loads on RHEL 7 ELS through any newer glibc) and matches how the Gateway itself
+# is built (its cgo is linked with the CentOS 7 gcc 4.8.5 / glibc 2.17 toolchain). 2.31 =
+# Debian bullseye - opt-in, for plugins whose C code needs a glibc 2.18-2.31 function.
+ARG GLIBC_TARGET=2.17
 ARG BASE_IMAGE=dhi.io/debian-base:trixie-debian13-dev
 
 ############################################################################
-# Stage 1 - glibc-2.31 sysroots (amd64 + arm64 + s390x), from Debian cross pkgs
+# Stage 1 - glibc link sysroots (amd64 + arm64 + s390x). Two sources, selected by
+# GLIBC_TARGET; only the selected one is built. Both assembled on the native BUILD host
+# (arch-independent target files COPYed into both final-stage arches) - never emulated.
 ############################################################################
-# Pinned to the native BUILD host: the sysroots are architecture-independent cross
-# files (target-arch libs/headers) COPYed into both arch variants of the final stage,
-# so this must NOT be emulated. Emulated apt/dpkg on bullseye fails (exit 100) under QEMU.
-FROM --platform=$BUILDPLATFORM debian:${SYSROOT_SUITE}-slim AS sysroots
+
+# --- 2.31 sysroots, from Debian bullseye cross packages (opt-in) -----------
+FROM --platform=$BUILDPLATFORM debian:${SYSROOT_SUITE}-slim AS sysroots-2.31
 ARG GLIBC_TARGET
 ARG SYSROOT_SUITE
 RUN set -eux; \
@@ -45,12 +50,50 @@ RUN set -eux; \
       done; \
       test -f "$SR/usr/lib/libc.so.6"; test -f "$SR/usr/include/stdlib.h"; \
     done; \
-    { echo "glibc target : ${GLIBC_TARGET}"; \
-      echo "source suite : debian ${SYSROOT_SUITE} cross packages"; \
-      echo "triplet amd64: x86_64-linux-gnu  (loader /lib64/ld-linux-x86-64.so.2)"; \
-      echo "triplet arm64: aarch64-linux-gnu (loader /lib/ld-linux-aarch64.so.1)"; \
-      echo "triplet s390x: s390x-linux-gnu   (loader /lib/ld64.so.1, big-endian)"; \
-    } > /opt/tyk/sysroots/PROVENANCE.txt
+    echo "glibc ${GLIBC_TARGET} from debian ${SYSROOT_SUITE} cross packages" > /opt/tyk/sysroots/PROVENANCE.txt
+
+# --- 2.17 sysroots, from manylinux2014 = CentOS 7 = RHEL 7 ABI (default) ----
+# COPY (filesystem only, no exec) so foreign-arch glibc trees extract without QEMU.
+# Pinned by digest (source of truth + full arch ceiling: data/sysroot-2.17-digests.txt).
+# glibc 2.17's ABI is frozen, so these never need bumping for the floor itself; re-pin only
+# to refresh the (unused-at-runtime) userspace. CentOS 7 is EOL but the perennial
+# manylinux2014 tag stays published; UBI7 is a maintained fallback.
+# buildkit fetches only the layers backing the COPYed /usr/lib64+/usr/include, and this
+# whole stage is registry-cached by the base job - so manylinux is pulled once, not per build.
+FROM --platform=linux/amd64 quay.io/pypa/manylinux2014_x86_64@sha256:5e3012db7af44490157351ba6726fd92e8dba9b421ea819ac7925b4478ad3f17  AS ml-amd64
+FROM --platform=linux/arm64 quay.io/pypa/manylinux2014_aarch64@sha256:88be65bf6654ffb068b2c07fb321ce1a128ccc092b62bbb79027217dbdec12ae AS ml-arm64
+FROM --platform=linux/s390x quay.io/pypa/manylinux2014_s390x@sha256:554ae29bc5aa3dbb1ce3062114180b6c4b9d7f5c555ede43652baf4f5d71959c   AS ml-s390x
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS sysroots-2.17
+ARG GLIBC_TARGET
+COPY --from=ml-amd64 /usr/lib64   /ml/amd64/lib
+COPY --from=ml-amd64 /usr/include /ml/amd64/include
+COPY --from=ml-arm64 /usr/lib64   /ml/arm64/lib
+COPY --from=ml-arm64 /usr/include /ml/arm64/include
+COPY --from=ml-s390x /usr/lib64   /ml/s390x/lib
+COPY --from=ml-s390x /usr/include /ml/s390x/include
+RUN set -eux; \
+    for spec in "amd64 ld-linux-x86-64.so.2" "arm64 ld-linux-aarch64.so.1" "s390x ld64.so.1"; do \
+      set -- $spec; arch=$1; loader=$2; \
+      SR=/opt/tyk/sysroots/linux-${arch}-glibc-${GLIBC_TARGET}; \
+      mkdir -p "$SR/usr/include" "$SR/usr/lib" "$SR/lib"; \
+      cp -a /ml/${arch}/include/. "$SR/usr/include/"; \
+      # full copy so .so->.so.N->lib-2.17.so symlink chains stay intact, then prune the CentOS \
+      # userspace bloat (manylinux /usr/lib64 is a whole distro - python, dnf, etc.). \
+      cp -a /ml/${arch}/lib/. "$SR/usr/lib/"; \
+      rm -rf "$SR/usr/lib/python"* "$SR/usr/lib/"*.py "$SR/usr/lib/rpm" "$SR/usr/lib/dracut" \
+             "$SR/usr/lib/dnf"* "$SR/usr/lib/systemd" "$SR/usr/lib/udev" 2>/dev/null || true; \
+      # the loader is runtime-only (a -buildmode=plugin .so has no interp) - best-effort, deref symlinks \
+      cp -aL "/ml/${arch}/lib/${loader}" "$SR/lib/${loader}" 2>/dev/null || true; \
+      # rewrite GROUP/AS_NEEDED absolute paths in the REAL ld scripts only (OUTPUT_FORMAT marks them) \
+      for f in $(grep -rIl 'OUTPUT_FORMAT' "$SR/usr/lib" 2>/dev/null || true); do \
+        sed -i -e 's#/usr/lib64/#/usr/lib/#g' -e 's#/lib64/lib#/usr/lib/lib#g' -e 's#/lib64/ld#/lib/ld#g' "$f"; \
+      done; \
+      test -f "$SR/usr/lib/libc.so.6"; test -f "$SR/usr/include/stdlib.h"; \
+    done; \
+    echo "glibc ${GLIBC_TARGET} from manylinux2014 (CentOS 7 / RHEL 7 ABI)" > /opt/tyk/sysroots/PROVENANCE.txt
+
+# --- pick the sysroot set by GLIBC_TARGET (only this one is built) ----------
+FROM sysroots-${GLIBC_TARGET} AS sysroots
 
 ############################################################################
 # Stage 2 - the base toolchain image (no Go, no Gateway source)
@@ -65,7 +108,9 @@ ARG DHI_DIGEST=unknown
 RUN set -eux; \
     if command -v apt-get >/dev/null; then \
         apt-get update; \
-        pkgs="bash jq ca-certificates curl binutils file make \
+        # binutils-gold: OLD Go (<1.18) links -buildmode=plugin for the NATIVE arch with
+        # -fuse-ld=gold; without ld.gold the external link fails "cannot find 'ld'". See build.sh.
+        pkgs="bash jq ca-certificates curl binutils binutils-gold file make \
               gcc gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu gcc-s390x-linux-gnu"; \
         [ "$WITH_CXX" = "1" ] && pkgs="$pkgs g++ g++-x86-64-linux-gnu g++-aarch64-linux-gnu g++-s390x-linux-gnu"; \
         [ "$WITH_GIT" = "1" ] && pkgs="$pkgs git"; \

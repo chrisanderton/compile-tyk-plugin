@@ -21,7 +21,7 @@ release-specific parts are cheap to rebuild:
 
 ```
 compile-tyk-plugin-base:<toolchain-date>     # slow cadence
-  base OS + gcc and cross toolchains + glibc-2.31 sysroots + build.sh + validator
+  base OS + gcc and cross toolchains + glibc sysroots (2.17 default) + build.sh + validator
 
 compile-tyk-plugin:vX.Y.Z                    # per release, cheap
   FROM compile-tyk-plugin-base
@@ -62,7 +62,7 @@ absorbs it with no code change.
 - **Per-edition architectures** - read from each Gateway manifest; the build's arch guard
   and the CI gate matrix follow them. A new architecture within an existing toolchain is
   picked up automatically.
-- **Newer runtime glibc** - plugins target a fixed glibc-2.31 floor, so any forward move
+- **Newer runtime glibc** - plugins target a fixed glibc-2.17 floor (RHEL 7 ABI), so any forward move
   in the runtime's glibc still loads.
 - **Base CVEs** - the hardened base is patched upstream; `watch.yml` rebuilds when the
   base digest changes.
@@ -100,7 +100,7 @@ under your namespace. The external contract is a single input: the Gateway versi
 | File | Role |
 |---|---|
 | `scripts/resolve-gateway.sh` | Input `vX.Y.Z`. Reads the published Gateway image and emits `GITHUB_SHA`, the exact `GO_VERSION`, Go checksums, and per-edition settings. |
-| `Dockerfile.base` | Stable layer: base OS, toolchains, glibc-2.31 sysroots, scripts. No Go or source. Records the base digest it was built from (label `io.ctp.dhi-base-digest`). |
+| `Dockerfile.base` | Stable layer: base OS, toolchains, glibc sysroots (2.17 default), scripts. No Go or source. Records the base digest it was built from (label `io.ctp.dhi-base-digest`). |
 | `Dockerfile.release` | `FROM` base, plus the exact Go and the vendored Gateway source. Built per release. |
 | `.github/workflows/build.yml` | `resolve -> base -> build-candidate -> gate -> publish`. The compiler image is edition-agnostic, so it is built ONCE per arch (native amd64/arm64 runners, no QEMU) and pushed to GHCR by digest. The gate then pulls that image and loads a real plugin into the matching Gateway for every edition/arch. Publish stitches the two gated per-arch images into one multi-arch manifest (`imagetools create`, no rebuild) and tags it in GHCR + Docker Hub, so you publish the exact images the gate proved. Publish is blocked unless every gate passes. |
 | `scripts/loadtest-gate.sh` | The gate logic: build a plugin, then verify it loads via the Gateway's own `tyk plugin load -s <symbol>` ABI check. Reusable standalone. |

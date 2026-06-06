@@ -49,6 +49,11 @@ on:
         required: false
         type: string
         default: ""
+      glibc_target:
+        description: "Plugin glibc floor: 2.17 (RHEL 7+, default) or 2.31 (Debian; newer glibc fns)"
+        required: false
+        type: string
+        default: "2.17"
   workflow_call:
     inputs:
       gateway_version:
@@ -58,6 +63,10 @@ on:
         required: false
         type: boolean
         default: true
+      glibc_target:
+        required: false
+        type: string
+        default: "2.17"
       gateway_image_repo:
         required: false
         type: string
@@ -98,6 +107,7 @@ jobs:
     outputs:
       go_version: ${{ steps.r.outputs.GO_VERSION }}
       gateway_trimpath: ${{ steps.r.outputs.GATEWAY_TRIMPATH }}
+      gateway_src_root: ${{ steps.r.outputs.GATEWAY_SRC_ROOT }}
       github_sha: ${{ steps.r.outputs.GITHUB_SHA }}
       github_tag: ${{ steps.r.outputs.GITHUB_TAG }}
       sha_amd64:  ${{ steps.r.outputs.GO_SHA256_amd64 }}
@@ -235,6 +245,7 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ env.DHI_BASE }}@${{ needs.resolve.outputs.dhi_digest }}
             DHI_DIGEST=${{ needs.resolve.outputs.dhi_digest }}
+            GLIBC_TARGET=${{ inputs.glibc_target || '2.17' }}
           tags: ${{ steps.basetags.outputs.tags }}
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base:buildcache,mode=max
@@ -283,6 +294,7 @@ jobs:
             BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base@${{ needs.base.outputs.digest }}
             GO_VERSION=${{ needs.resolve.outputs.go_version }}
             GATEWAY_TRIMPATH=${{ needs.resolve.outputs.gateway_trimpath }}
+            GATEWAY_SRC_ROOT=${{ needs.resolve.outputs.gateway_src_root }}
             GO_SHA256_amd64=${{ needs.resolve.outputs.sha_amd64 }}
             GO_SHA256_arm64=${{ needs.resolve.outputs.sha_arm64 }}
             GITHUB_SHA=${{ needs.resolve.outputs.github_sha }}
