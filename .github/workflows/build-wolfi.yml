@@ -92,7 +92,9 @@ jobs:
                 arm64) runner=ubuntu-24.04-arm ;;
                 *)     runner=ubuntu-latest ;;
               esac
-              echo "{\"edition\":\"$1\",\"arch\":\"$a\",\"gateway\":\"$2:$TAG\",\"runner\":\"$runner\"}"
+              # Wolfi is native-only (no cross toolchain; arches already filtered to amd64/arm64
+              # by step n), so the candidate to gate is the one built for THIS arch: build_arch=arch.
+              echo "{\"edition\":\"$1\",\"arch\":\"$a\",\"gateway\":\"$2:$TAG\",\"runner\":\"$runner\",\"build_arch\":\"$a\"}"
             done
           }
           # if/then (not `[ ] && entries`): a false edition check must not leave the block
