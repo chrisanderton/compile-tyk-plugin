@@ -158,6 +158,12 @@ jobs:
           file: Dockerfile.base
           platforms: linux/amd64,linux/arm64
           push: true
+          # index:* annotations populate the GHCR package description + repo link for the index.
+          annotations: |
+            index:org.opencontainers.image.title=compile-tyk-plugin-base-wolfi
+            index:org.opencontainers.image.description=Stable Wolfi toolchain + glibc sysroot base for compile-tyk-plugin (no Go, no Gateway source). Community/unofficial.
+            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            index:org.opencontainers.image.licenses=MPL-2.0
           build-args: |
             BASE_IMAGE=${{ env.WOLFI_BASE }}@${{ needs.resolve.outputs.wolfi_digest }}
             DHI_DIGEST=${{ needs.resolve.outputs.wolfi_digest }}
@@ -295,7 +301,13 @@ jobs:
           ARM="$(cat /tmp/digest/arm64)"
           # ${SFX} keeps an opt-in 2.31 build on its own tags (e.g. :v5.13.0-wolfi-glibc2.31),
           # never overwriting the 2.17 default (:v5.13.0-wolfi). Empty for 2.17.
+          # index:* annotations populate the GHCR package description + repo link for the
+          # multi-arch index (a per-arch LABEL does not propagate to the index).
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.title=compile-tyk-plugin" \
+            --annotation "index:org.opencontainers.image.description=Community/unofficial modern low-CVE compiler for Tyk Go plugins (Wolfi base, glibc-2.17 sysroot default). Not affiliated with Tyk." \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.licenses=MPL-2.0" \
             -t "${GHCR_IMG}:${TAG}-wolfi${SFX}" -t "${GHCR_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
             -t "${DH_IMG}:${TAG}-wolfi${SFX}"   -t "${DH_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
             "${GHCR_IMG}@${AMD}" "${GHCR_IMG}@${ARM}"

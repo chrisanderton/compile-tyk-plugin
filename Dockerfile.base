@@ -143,6 +143,7 @@ RUN mkdir -p $TYK_GW_PATH $PLUGIN_SOURCE_PATH /go/bin
 
 LABEL org.opencontainers.image.title="compile-tyk-plugin-base" \
       org.opencontainers.image.description="Stable toolchain+sysroot base for compile-tyk-plugin (no Go, no Gateway source). Community/unofficial." \
+      org.opencontainers.image.licenses="MPL-2.0" \
       io.ctp.glibc-target="${GLIBC_TARGET}" \
       io.ctp.base-image="${BASE_IMAGE}" \
       io.ctp.dhi-base-digest="${DHI_DIGEST}"

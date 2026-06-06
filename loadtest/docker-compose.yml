@@ -13,7 +13,9 @@ services:
     image: ${GATEWAY_IMAGE:-tykio/tyk-gateway:v5.13.0}
     depends_on: [redis]
     volumes:
-      - ./test-plugin/plugin.so:/opt/tyk-gateway/middleware/plugin.so
+      # Mounted at the Gateway's expanded plugin name (plugin_<ver>_linux_<arch>.so, set by
+      # e2e-compose.sh via $PLUGIN_FILE); falls back to plugin.so for manual `docker compose up`.
+      - ./test-plugin/${PLUGIN_FILE:-plugin.so}:/opt/tyk-gateway/middleware/${PLUGIN_FILE:-plugin.so}
       - ./test-plugin/apidef.json:/opt/tyk-gateway/apps/testplugin.json
     ports:
       - "8080:8080"

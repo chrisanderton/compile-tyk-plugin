@@ -3,11 +3,12 @@ services:
     image: redis:6.0-alpine
     healthcheck: { test: ["CMD","redis-cli","--raw","incr","ping"], interval: 3s, retries: 10, timeout: 5s }
   gw:
-    image: tykio/tyk-gateway:v5.13.0
+    image: ${GATEWAY_IMAGE:-tykio/tyk-gateway:v5.13.0}
     platform: linux/amd64            # force amd64 (emulated) to match the amd64 plugin
     depends_on: [redis]
     volumes:
-      - ./test-plugin/plugin.so:/opt/tyk-gateway/middleware/plugin.so
+      # expanded plugin name set by e2e-compose.sh ($PLUGIN_FILE); plugin.so fallback for manual use
+      - ./test-plugin/${PLUGIN_FILE:-plugin.so}:/opt/tyk-gateway/middleware/${PLUGIN_FILE:-plugin.so}
       - ./test-plugin/apidef.json:/opt/tyk-gateway/apps/testplugin.json
     ports: ["8080:8080"]
     environment: [TYK_DB_REDISHOST=redis, TYK_LOGLEVEL=debug]
