@@ -248,6 +248,8 @@ jobs:
           file: Dockerfile.base
           platforms: linux/amd64,linux/arm64
           push: true
+          provenance: true   # SLSA provenance + SPDX SBOM attestations on the base index too
+          sbom: true
           # index:* annotations populate the GHCR package description + repo link for the
           # multi-arch base index (a per-arch LABEL alone does not reach the index).
           annotations: |
