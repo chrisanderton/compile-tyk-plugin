@@ -58,18 +58,24 @@ RUN set -eux; \
 # glibc 2.17's ABI is frozen, so these never need bumping for the floor itself; re-pin only
 # to refresh the (unused-at-runtime) userspace. CentOS 7 is EOL but the perennial
 # manylinux2014 tag stays published; UBI7 is a maintained fallback.
-# buildkit fetches only the layers backing the COPYed /usr/lib64+/usr/include, and this
+# buildkit fetches only the layers backing the COPYed /usr/lib64+/lib64+/usr/include, and this
 # whole stage is registry-cached by the base job - so manylinux is pulled once, not per build.
 FROM --platform=linux/amd64 quay.io/pypa/manylinux2014_x86_64@sha256:5e3012db7af44490157351ba6726fd92e8dba9b421ea819ac7925b4478ad3f17  AS ml-amd64
 FROM --platform=linux/arm64 quay.io/pypa/manylinux2014_aarch64@sha256:88be65bf6654ffb068b2c07fb321ce1a128ccc092b62bbb79027217dbdec12ae AS ml-arm64
 FROM --platform=linux/s390x quay.io/pypa/manylinux2014_s390x@sha256:554ae29bc5aa3dbb1ce3062114180b6c4b9d7f5c555ede43652baf4f5d71959c   AS ml-s390x
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS sysroots-2.17
 ARG GLIBC_TARGET
+# CentOS 7 is PRE-usrmerge: the -ldev symlinks (libresolv.so etc.) live in /usr/lib64 but point at
+# the RUNTIME libs in /lib64 (../../lib64/libX.so.N). So we need BOTH trees, or those symlinks dangle
+# and a cgo link that pulls e.g. -lresolv (net DNS) fails "cannot open .../libresolv.so".
 COPY --from=ml-amd64 /usr/lib64   /ml/amd64/lib
+COPY --from=ml-amd64 /lib64       /ml/amd64/lib64
 COPY --from=ml-amd64 /usr/include /ml/amd64/include
 COPY --from=ml-arm64 /usr/lib64   /ml/arm64/lib
+COPY --from=ml-arm64 /lib64       /ml/arm64/lib64
 COPY --from=ml-arm64 /usr/include /ml/arm64/include
 COPY --from=ml-s390x /usr/lib64   /ml/s390x/lib
+COPY --from=ml-s390x /lib64       /ml/s390x/lib64
 COPY --from=ml-s390x /usr/include /ml/s390x/include
 RUN set -eux; \
     for spec in "amd64 ld-linux-x86-64.so.2" "arm64 ld-linux-aarch64.so.1" "s390x ld64.so.1"; do \
@@ -77,18 +83,27 @@ RUN set -eux; \
       SR=/opt/tyk/sysroots/linux-${arch}-glibc-${GLIBC_TARGET}; \
       mkdir -p "$SR/usr/include" "$SR/usr/lib" "$SR/lib"; \
       cp -a /ml/${arch}/include/. "$SR/usr/include/"; \
-      # full copy so .so->.so.N->lib-2.17.so symlink chains stay intact, then prune the CentOS \
-      # userspace bloat (manylinux /usr/lib64 is a whole distro - python, dnf, etc.). \
-      cp -a /ml/${arch}/lib/. "$SR/usr/lib/"; \
+      # full copy so .so->.so.N->lib-2.17.so symlink chains stay intact. Merge BOTH /usr/lib64 \
+      # (dev symlinks + static + ld scripts) and /lib64 (runtime libX.so.N) into one flat usr/lib, \
+      # then prune the CentOS userspace bloat (manylinux /usr/lib64 is a whole distro). \
+      cp -a /ml/${arch}/lib/.   "$SR/usr/lib/"; \
+      cp -a /ml/${arch}/lib64/. "$SR/usr/lib/"; \
       rm -rf "$SR/usr/lib/python"* "$SR/usr/lib/"*.py "$SR/usr/lib/rpm" "$SR/usr/lib/dracut" \
              "$SR/usr/lib/dnf"* "$SR/usr/lib/systemd" "$SR/usr/lib/udev" 2>/dev/null || true; \
+      # repoint any dev symlink that still targets the old split /lib64 path (e.g. \
+      # libresolv.so -> ../../lib64/libresolv.so.2) to the basename now present in this flat dir. \
+      for l in $(find "$SR/usr/lib" -maxdepth 1 -type l 2>/dev/null || true); do \
+        t="$(readlink "$l")"; case "$t" in *lib64/*) ln -sf "$(basename "$t")" "$l" ;; esac; \
+      done; \
       # the loader is runtime-only (a -buildmode=plugin .so has no interp) - best-effort, deref symlinks \
       cp -aL "/ml/${arch}/lib/${loader}" "$SR/lib/${loader}" 2>/dev/null || true; \
       # rewrite GROUP/AS_NEEDED absolute paths in the REAL ld scripts only (OUTPUT_FORMAT marks them) \
       for f in $(grep -rIl 'OUTPUT_FORMAT' "$SR/usr/lib" 2>/dev/null || true); do \
         sed -i -e 's#/usr/lib64/#/usr/lib/#g' -e 's#/lib64/lib#/usr/lib/lib#g' -e 's#/lib64/ld#/lib/ld#g' "$f"; \
       done; \
+      # sanity: libc + a representative split-out dev symlink must RESOLVE (not dangle) \
       test -f "$SR/usr/lib/libc.so.6"; test -f "$SR/usr/include/stdlib.h"; \
+      test -e "$SR/usr/lib/libresolv.so"; test -e "$SR/usr/lib/libnsl.so"; \
     done; \
     echo "glibc ${GLIBC_TARGET} from manylinux2014 (CentOS 7 / RHEL 7 ABI)" > /opt/tyk/sysroots/PROVENANCE.txt
 
