@@ -193,6 +193,7 @@ jobs:
       - name: Dispatch release builds (oldest first; lone-first on an empty package)
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # gh has no git checkout here - point it at the repo
           MAIN_MISSING: ${{ needs.plan.outputs.main_missing }}
           BASE_VARIANT: ${{ needs.plan.outputs.base_variant }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
@@ -216,5 +217,10 @@ jobs:
             if [ -n "$first" ]; then gh workflow run build.yml -f gateway_version="$first" -f push=true || echo "WARN: dispatch failed $first"; fi
             exit 0
           fi
-          for v in $dhi;   do echo "dispatch DHI $v";   gh workflow run build.yml       -f gateway_version="$v" -f push=true || echo "WARN: dhi dispatch failed $v";   done
-          for v in $wolfi; do echo "dispatch Wolfi $v"; gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true || echo "WARN: wolfi dispatch failed $v"; done
+          ok=0; fail=0
+          for v in $dhi;   do echo "dispatch DHI $v";   if gh workflow run build.yml       -f gateway_version="$v" -f push=true; then ok=$((ok+1)); else echo "WARN: dhi dispatch failed $v";   fail=$((fail+1)); fi; done
+          for v in $wolfi; do echo "dispatch Wolfi $v"; if gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true; then ok=$((ok+1)); else echo "WARN: wolfi dispatch failed $v"; fail=$((fail+1)); fi; done
+          echo "dispatched ok=$ok failed=$fail"
+          # per-item resilience (one bad dispatch never blocks the rest), but a TOTAL failure
+          # (e.g. wrong repo/permissions) must fail loudly, not look like a successful no-op.
+          [ "$ok" -gt 0 ] || { echo "::error::all ${fail} dispatch(es) failed - see WARNs above"; exit 1; }
