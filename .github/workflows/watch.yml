@@ -9,8 +9,10 @@ name: watch
 #   * MISSING IMAGE     -> build it (new gateway release, or first-run backfill of a maintained
 #                          line's older/frozen patches). Both DHI + Wolfi.
 #   * EDITION/ARCH DRIFT -> rebuild (ACTIVE only; e.g. an edition gains s390x).
-#   * NEW BASE DIGEST   -> re-stack the ACTIVE set on the fresh base. DHI and Wolfi bases are
-#                          watched INDEPENDENTLY (a DHI change re-stacks DHI only; Wolfi -> Wolfi).
+#   * STALE BASE        -> re-stack any ACTIVE version not on the live base. LEVEL-triggered per
+#                          version (compares each image's recorded io.ctp.dhi-base-digest to the
+#                          live base), so a capped/failed run just catches up next time - no
+#                          silent staleness. DHI and Wolfi bases are checked INDEPENDENTLY.
 # Editions ce/ee/ee-fips all ship from one image per version. See docs/maintenance.md + SUPPORT.md.
 
 on:
@@ -80,68 +82,57 @@ jobs:
           GW_CE_REPO: tykio/tyk-gateway
         run: |
           set -euo pipefail
-          base_ref="ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base:latest"
           img="ghcr.io/${GHCR_NS}/${IMAGE_NAME}"
 
-          # --- has the DHI base changed since we last built our base? ---
+          # Live base digests - the source a compiler SHOULD be stacked on. A compiler image records
+          # the base it was built from in io.ctp.dhi-base-digest (inherited from the base; the Wolfi
+          # compiler records the Wolfi base digest the same way).
           dhi_now="$(crane digest "${DHI_BASE}")"
-          dhi_last="$(crane config "$base_ref" 2>/dev/null \
-                      | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty' || true)"
-          dhi_changed=false
-          [ "$dhi_now" != "$dhi_last" ] && dhi_changed=true
-          echo "DHI now=$dhi_now last=${dhi_last:-<none>} changed=$dhi_changed"
-
-          # --- has the WOLFI base changed since we last built our wolfi base? ---
-          # (Independent from DHI: the two bases update on their own schedules. The wolfi base
-          # records its source digest in the same io.ctp.dhi-base-digest label.)
-          wbase_ref="ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi:latest"
           wolfi_now="$(crane digest "${WOLFI_BASE}")"
-          wolfi_last="$(crane config "$wbase_ref" 2>/dev/null \
-                        | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty' || true)"
-          wolfi_changed=false
-          [ "$wolfi_now" != "$wolfi_last" ] && wolfi_changed=true
-          echo "WOLFI now=$wolfi_now last=${wolfi_last:-<none>} changed=$wolfi_changed"
+          echo "live base: DHI=$dhi_now WOLFI=$wolfi_now"
 
-          # Editions (ce/ee/fips) all ship from ONE image per version. Resolve releases.yml (the
-          # support policy) into the concrete sets: ACTIVE = base-CVE-updated (moving tag re-stacked,
-          # snapshots kept); FROZEN = built once and kept, no further base updates. Build set =
-          # ACTIVE + FROZEN. Only ACTIVE is re-stacked on a base change. One source of truth, shared
-          # with prune.yml, so they cannot drift.
+          # Resolve releases.yml -> ACTIVE (base-CVE-current) + FROZEN (built once, kept). Editions
+          # ce/ee/fips all ship from one image per version. Shared with prune.yml so they can't drift.
           resolved="$(GW_CE_REPO="$GW_CE_REPO" SOURCE_REPO="$SOURCE_REPO" bash scripts/resolve-releases.sh)"
           active="$(printf '%s\n' "$resolved" | awk '$1=="ACTIVE"{print $2}')"
           frozen="$(printf '%s\n' "$resolved" | awk '$1=="FROZEN"{print $2}')"
-          build_set="$(printf '%s\n' $active $frozen | grep -E '^v' | sort -uV | uniq || true)"
-          [ -n "$build_set" ] || { echo "::error::empty policy set (resolve-releases failed?) - aborting"; exit 1; }
-          echo "policy: $(printf '%s\n' $active|grep -c .) active, $(printf '%s\n' $frozen|grep -c .) frozen ($(printf '%s\n' $build_set|grep -c .) kept)"
+          [ -n "$active$frozen" ] || { echo "::error::empty policy set (resolve-releases failed?) - aborting"; exit 1; }
+          echo "policy: $(printf '%s\n' $active|grep -c .) active, $(printf '%s\n' $frozen|grep -c .) frozen"
 
-          # Decisions are per-variant (DHI / Wolfi independent). Gateway-driven work (new image /
-          # arch drift) applies to both; base-CVE re-stacks only to the variant whose base moved.
           live_archs() { crane manifest "$1" 2>/dev/null \
             | jq -r '[.manifests[]?|select((.platform.os//"")=="linux" and (.platform.architecture//"")!="unknown")|.platform.architecture]|sort|unique|join(",")' 2>/dev/null || true; }
+          base_of() { crane config "$1" 2>/dev/null | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty'; }
           need_dhi=""; need_wolfi=""
 
-          # (1) Build any KEPT version (ACTIVE or FROZEN) that has no image yet - new releases plus
-          #     the one-time backfill of a maintained line's older patches. Per variant.
-          for v in $build_set; do
-            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image";   need_dhi="$need_dhi $v"; }
-            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image"; need_wolfi="$need_wolfi $v"; }
-          done
-          # (2) Edition/arch drift (e.g. an edition gains s390x) -> rebuild. ACTIVE only - FROZEN
-          #     versions are deliberately not refreshed.
+          # (1) ACTIVE is LEVEL-TRIGGERED: re-stack a version whenever its image is missing OR not on
+          #     the live base (its recorded io.ctp.dhi-base-digest != live). This CONVERGES even when
+          #     a run is capped by MAX_DISPATCH or a build fails - every run re-checks each version's
+          #     ACTUAL base, so laggards catch up over later runs instead of silently going stale.
+          #     (A global edge-triggered base-change flag would 'consume' the trigger after the first
+          #     re-stack and strand the rest.) Per variant - DHI and Wolfi bases move independently.
           for v in $active; do
             cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
-            [ "$cfg" = '{}' ] && continue   # not built yet; step (1) covers it
+            dhi_have="$(echo "$cfg" | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty')"
+            if [ "$FORCE_ALL" = "true" ] || [ "$dhi_have" != "$dhi_now" ]; then
+              echo "-> $v: DHI re-stack (on ${dhi_have:-<missing>}, want ${dhi_now})"; need_dhi="$need_dhi $v"; fi
+            wolfi_have="$(base_of "${img}:${v}-wolfi")"
+            if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then
+              echo "-> $v: Wolfi re-stack (on ${wolfi_have:-<missing>}, want ${wolfi_now})"; need_wolfi="$need_wolfi $v"; fi
+            # edition/arch coverage drift (read from the existing DHI image) -> rebuild both variants
+            [ "$cfg" = '{}' ] && continue
             for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
               ed="${spec%%:*}"; gw="${spec##*:}"
               live="$(live_archs "${gw}:${v}")"; have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
               [ "$live" != "$have" ] && { echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; need_dhi="$need_dhi $v"; need_wolfi="$need_wolfi $v"; }
             done
           done
-          # (3) Base CVE re-stack -> ACTIVE set only, independent per variant.
-          if [ "$dhi_changed" = "true" ]   || [ "$FORCE_ALL" = "true" ]; then echo "-> DHI base changed/forced - re-stack ACTIVE";   need_dhi="$need_dhi $active"; fi
-          if [ "$wolfi_changed" = "true" ] || [ "$FORCE_ALL" = "true" ]; then echo "-> Wolfi base changed/forced - re-stack ACTIVE"; need_wolfi="$need_wolfi $active"; fi
+          # (2) FROZEN: build once if the image is missing; never re-stacked on a base change.
+          for v in $frozen; do
+            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image (frozen)";   need_dhi="$need_dhi $v"; }
+            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)"; need_wolfi="$need_wolfi $v"; }
+          done
 
-          # dedupe + cap per run (MAX_DISPATCH spreads a big first-run backfill over days), dispatch.
+          # dedupe + cap per run (MAX_DISPATCH spreads a big backfill / re-stack over days), dispatch.
           dhi_uniq="$(echo $need_dhi     | tr ' ' '\n' | grep -E '^v' | sort -u | head -n "${MAX_DISPATCH}" || true)"
           wolfi_uniq="$(echo $need_wolfi | tr ' ' '\n' | grep -E '^v' | sort -u | head -n "${MAX_DISPATCH}" || true)"
           [ -n "$dhi_uniq$wolfi_uniq" ] || { echo "nothing to build"; exit 0; }
