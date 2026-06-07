@@ -5,6 +5,9 @@ name: build-wolfi
 # NATIVELY for amd64 and arm64 only (no s390x, no cross). It reuses the same
 # resolver as the default (DHI) pipeline and publishes `:vX.Y.Z-wolfi` tags.
 #
+# The STABLE Wolfi base is NOT built here - it is built once by build-base.yml
+# (variant wolfi) and this workflow just `FROM`s compile-tyk-plugin-base-wolfi:latest.
+#
 # Config: DOCKERHUB_USER (repo variable = username + namespace) and DOCKERHUB_TOKEN
 # (repo secret = Docker Hub PAT, Read & Write). GHCR uses the built-in GITHUB_TOKEN.
 
@@ -24,7 +27,6 @@ on:
 
 env:
   IMAGE_NAME: compile-tyk-plugin
-  WOLFI_BASE: cgr.dev/chainguard/wolfi-base:latest
   GHCR_NS: ${{ github.repository_owner }}
 
 permissions:
@@ -42,6 +44,7 @@ jobs:
       github_tag: ${{ steps.r.outputs.GITHUB_TAG }}
       sha_amd64:  ${{ steps.r.outputs.GO_SHA256_amd64 }}
       sha_arm64:  ${{ steps.r.outputs.GO_SHA256_arm64 }}
+      base_ref:   ${{ steps.basepin.outputs.ref }}
       ee_available:      ${{ steps.r.outputs.EE_AVAILABLE }}
       ee_build_tag:      ${{ steps.r.outputs.EE_BUILD_TAG }}
       fips_available:    ${{ steps.r.outputs.FIPS_AVAILABLE }}
@@ -53,7 +56,6 @@ jobs:
       ee_archs:   ${{ steps.n.outputs.ee }}
       fips_archs: ${{ steps.n.outputs.fips }}
       gate_matrix: ${{ steps.gm.outputs.matrix }}
-      wolfi_digest: ${{ steps.wd.outputs.digest }}
       date:  ${{ steps.meta.outputs.date }}
       dh_ns: ${{ steps.meta.outputs.dh_ns }}
       glibc_suffix: ${{ steps.meta.outputs.glibc_suffix }}
@@ -104,8 +106,12 @@ jobs:
             if [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ];   then entries ee tykio/tyk-gateway-ee "${{ steps.n.outputs.ee }}"; fi
             if [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ]; then entries ee-fips tykio/tyk-gateway-fips "${{ steps.n.outputs.fips }}"; fi
           } | jq -sc . | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
-      - id: wd
-        run: echo "digest=$(crane digest ${WOLFI_BASE})" >> "$GITHUB_OUTPUT"
+      - name: Login to GHCR (read the prebuilt Wolfi base digest)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
         run: |
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
@@ -114,72 +120,21 @@ jobs:
           # overwrites the canonical 2.17 default images (empty => 2.17, untouched).
           g="${{ inputs.glibc_target }}"; g="${g:-2.17}"
           if [ "$g" = "2.17" ]; then echo "glibc_suffix=" >> "$GITHUB_OUTPUT"; else echo "glibc_suffix=-glibc$g" >> "$GITHUB_OUTPUT"; fi
-
-  base:
-    needs: resolve
-    runs-on: ubuntu-latest
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          registry: docker.io
-          username: ${{ vars.DOCKERHUB_USER }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      # The gate pulls the base BY DIGEST from separate runners, so the base must ALWAYS
-      # be pushed to GHCR even on a push=false dry run (else the digest is empty and the
-      # gate fails with a "-base-wolfi@" reference). Docker Hub mirror is gated by `push`.
-      - id: basetags
+      # Pin the Wolfi base built by build-base.yml (variant wolfi). The compiler FROMs this
+      # exact digest and inherits its io.ctp.dhi-base-digest label.
+      - id: basepin
         env:
-          PUSH: ${{ inputs.push }}
-          DH_NS: ${{ needs.resolve.outputs.dh_ns }}
-          SFX: ${{ needs.resolve.outputs.glibc_suffix }}
+          SFX: ${{ steps.meta.outputs.glibc_suffix }}
         run: |
-          {
-            echo "tags<<EOF"
-            echo "ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi:latest${SFX}"
-            if [ "$PUSH" = "true" ]; then
-              echo "docker.io/${DH_NS}/${IMAGE_NAME}-base-wolfi:latest${SFX}"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-      - id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile.base
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: true   # SLSA provenance + SPDX SBOM attestations on the base index too
-          sbom: true
-          # index:* annotations populate the GHCR package description + repo link for the index.
-          annotations: |
-            index:org.opencontainers.image.title=compile-tyk-plugin-base-wolfi
-            index:org.opencontainers.image.description=Stable Wolfi toolchain + glibc sysroot base for compile-tyk-plugin (no Go, no Gateway source). Community/unofficial.
-            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            index:org.opencontainers.image.licenses=MPL-2.0
-          build-args: |
-            BASE_IMAGE=${{ env.WOLFI_BASE }}@${{ needs.resolve.outputs.wolfi_digest }}
-            DHI_DIGEST=${{ needs.resolve.outputs.wolfi_digest }}
-            GLIBC_TARGET=${{ inputs.glibc_target || '2.17' }}
-          tags: ${{ steps.basetags.outputs.tags }}
-          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache${{ needs.resolve.outputs.glibc_suffix }}
-          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi:buildcache${{ needs.resolve.outputs.glibc_suffix }},mode=max
+          base="ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi:latest${SFX}"
+          d="$(crane digest "$base")" || { echo "::error::base image $base not found - run build-base.yml (variant wolfi${SFX:+, glibc_target ${SFX#-glibc}}) first."; exit 1; }
+          echo "ref=ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi@${d}" >> "$GITHUB_OUTPUT"
 
   # Build the Wolfi compiler ONCE per arch (edition-agnostic), push to GHCR by digest.
   # Native amd64/arm64 only - Wolfi has no cross toolchain. Reused by gate + publish.
+  # FROMs the prebuilt Wolfi base pinned by resolve (no base build here).
   build-candidate:
-    needs: [resolve, base]
+    needs: [resolve]
     strategy:
       fail-fast: false
       matrix:
@@ -214,7 +169,7 @@ jobs:
           sbom: true
           outputs: type=image,name=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            BASE_IMAGE=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}-base-wolfi@${{ needs.base.outputs.digest }}
+            BASE_IMAGE=${{ needs.resolve.outputs.base_ref }}
             GO_VERSION=${{ needs.resolve.outputs.go_version }}
             GATEWAY_TRIMPATH=${{ needs.resolve.outputs.gateway_trimpath }}
             GATEWAY_SRC_ROOT=${{ needs.resolve.outputs.gateway_src_root }}

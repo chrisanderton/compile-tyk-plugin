@@ -2,17 +2,23 @@ name: watch
 
 # What to build/maintain is declared in releases.yml (the support policy) and resolved by
 # scripts/resolve-releases.sh into ACTIVE (base-CVE-updated) + FROZEN (built once, kept) sets,
-# intersected with buildable Gateway versions (git tag AND published image). This watcher acts on
-# that, prune.yml enforces the same policy on the registry - one source of truth, no drift.
+# intersected with buildable Gateway versions (git tag AND published image). prune.yml enforces
+# the same policy on the registry - one source of truth, no drift.
 #
-# Triggers:
-#   * MISSING IMAGE     -> build it (new gateway release, or first-run backfill of a maintained
-#                          line's older/frozen patches). Both DHI + Wolfi.
+# Three jobs, so the base is built ONCE and release builds only consume it:
+#   plan   -> resolve policy + detect drift. Outputs: which base(s) are stale, the capped
+#             oldest-first version lists to (re)build, and whether the main package exists yet.
+#   base   -> if a base is stale, call build-base.yml (workflow_call) to rebuild JUST that
+#             variant ONCE, before any release fans out. DHI and Wolfi move INDEPENDENTLY.
+#   fanout -> dispatch build.yml / build-wolfi.yml per version. They FROM the (now fresh) base,
+#             so a mass re-stack is N cheap release builds, not N base rebuilds.
+#
+# Triggers a version (re)build when:
+#   * MISSING IMAGE      -> new gateway release, or first-run backfill of a frozen patch.
 #   * EDITION/ARCH DRIFT -> rebuild (ACTIVE only; e.g. an edition gains s390x).
-#   * STALE BASE        -> re-stack any ACTIVE version not on the live base. LEVEL-triggered per
-#                          version (compares each image's recorded io.ctp.dhi-base-digest to the
-#                          live base), so a capped/failed run just catches up next time - no
-#                          silent staleness. DHI and Wolfi bases are checked INDEPENDENTLY.
+#   * STALE BASE         -> any ACTIVE version whose recorded io.ctp.dhi-base-digest != the live
+#                           base. LEVEL-triggered per version, so a capped/failed run just catches
+#                           up next time - no silent staleness.
 # Editions ce/ee/ee-fips all ship from one image per version. See docs/maintenance.md + SUPPORT.md.
 
 on:
@@ -21,20 +27,25 @@ on:
   workflow_dispatch:
     inputs:
       force_all:
-        description: "Rebuild all maintained versions regardless of changes"
+        description: "Rebuild both bases and re-stack all maintained versions regardless of changes"
         required: false
         type: boolean
         default: false
       max_dispatch:
-        description: "Cap builds dispatched per run (throttles the first-run backfill; raise for faster catch-up)"
+        description: "Cap release builds dispatched per run (throttles the first-run backfill; raise for faster catch-up)"
         required: false
         type: string
         default: "12"
+      dry_run:
+        description: "Plan only - log what would be (re)built and dispatched; build no base and dispatch nothing"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  actions: write                      # dispatch build.yml
-  packages: read                      # read existing tags / base label
+  actions: write                      # dispatch build.yml / build-wolfi.yml
+  packages: write                     # the base job (build-base via workflow_call) pushes
 
 env:
   IMAGE_NAME: compile-tyk-plugin
@@ -43,8 +54,14 @@ env:
   GHCR_NS: ${{ github.repository_owner }}
 
 jobs:
-  watch:
+  # ---- 1. Resolve policy + detect base/version drift -------------------------
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      base_variant:   ${{ steps.d.outputs.base_variant }}    # dhi | wolfi | both | none
+      dhi_versions:   ${{ steps.d.outputs.dhi_versions }}    # space list, capped, oldest-first
+      wolfi_versions: ${{ steps.d.outputs.wolfi_versions }}
+      main_missing:   ${{ steps.d.outputs.main_missing }}    # true | false (lone-first guard)
     steps:
       - uses: actions/checkout@v5
       - name: Check required config
@@ -73,7 +90,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Decide what to (re)build and dispatch
+      - name: Resolve policy and decide what is stale
+        id: d
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_ALL: ${{ inputs.force_all || 'false' }}
@@ -84,57 +102,116 @@ jobs:
           set -euo pipefail
           img="ghcr.io/${GHCR_NS}/${IMAGE_NAME}"
 
-          # Live base digests - the source a compiler SHOULD be stacked on. A compiler image records
-          # the base it was built from in io.ctp.dhi-base-digest (inherited from the base; the Wolfi
-          # compiler records the Wolfi base digest the same way).
+          # Live base digests - what a base/compiler SHOULD be stacked on.
           dhi_now="$(crane digest "${DHI_BASE}")"
           wolfi_now="$(crane digest "${WOLFI_BASE}")"
           echo "live base: DHI=$dhi_now WOLFI=$wolfi_now"
 
-          # Resolve releases.yml -> ACTIVE (base-CVE-current) + FROZEN (built once, kept). Editions
-          # ce/ee/fips all ship from one image per version. Shared with prune.yml so they can't drift.
+          # Resolve releases.yml -> ACTIVE (base-CVE-current) + FROZEN (built once, kept).
           resolved="$(GW_CE_REPO="$GW_CE_REPO" SOURCE_REPO="$SOURCE_REPO" bash scripts/resolve-releases.sh)"
           active="$(printf '%s\n' "$resolved" | awk '$1=="ACTIVE"{print $2}')"
           frozen="$(printf '%s\n' "$resolved" | awk '$1=="FROZEN"{print $2}')"
           [ -n "$active$frozen" ] || { echo "::error::empty policy set (resolve-releases failed?) - aborting"; exit 1; }
           echo "policy: $(printf '%s\n' $active|grep -c .) active, $(printf '%s\n' $frozen|grep -c .) frozen"
 
-          live_archs() { crane manifest "$1" 2>/dev/null \
+          base_of()   { crane config "$1" 2>/dev/null | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty'; }
+          live_archs(){ crane manifest "$1" 2>/dev/null \
             | jq -r '[.manifests[]?|select((.platform.os//"")=="linux" and (.platform.architecture//"")!="unknown")|.platform.architecture]|sort|unique|join(",")' 2>/dev/null || true; }
-          base_of() { crane config "$1" 2>/dev/null | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty'; }
-          need_dhi=""; need_wolfi=""
 
-          # (1) ACTIVE is LEVEL-TRIGGERED: re-stack a version whenever its image is missing OR not on
-          #     the live base (its recorded io.ctp.dhi-base-digest != live). This CONVERGES even when
-          #     a run is capped by MAX_DISPATCH or a build fails - every run re-checks each version's
-          #     ACTUAL base, so laggards catch up over later runs instead of silently going stale.
-          #     (A global edge-triggered base-change flag would 'consume' the trigger after the first
-          #     re-stack and strand the rest.) Per variant - DHI and Wolfi bases move independently.
+          # (A) Is the BASE LAYER itself stale? (missing, or built on an older upstream digest)
+          dhi_base_have="$(base_of "${img}-base:latest")"
+          wolfi_base_have="$(base_of "${img}-base-wolfi:latest")"
+          dhi_base_stale=false; wolfi_base_stale=false
+          if [ "$FORCE_ALL" = "true" ] || [ "$dhi_base_have"   != "$dhi_now"   ]; then dhi_base_stale=true;   fi
+          if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_base_have" != "$wolfi_now" ]; then wolfi_base_stale=true; fi
+          if   [ "$dhi_base_stale" = true ] && [ "$wolfi_base_stale" = true ]; then bv=both
+          elif [ "$dhi_base_stale" = true ]; then bv=dhi
+          elif [ "$wolfi_base_stale" = true ]; then bv=wolfi
+          else bv=none; fi
+          echo "base_variant=$bv" >> "$GITHUB_OUTPUT"
+          echo "base: DHI stale=$dhi_base_stale (on ${dhi_base_have:-<missing>}); WOLFI stale=$wolfi_base_stale (on ${wolfi_base_have:-<missing>}) -> rebuild=$bv"
+
+          # (B) Which VERSIONS need a (re)build - LEVEL-triggered per version (compare each image's
+          #     recorded base to live). Converges even when capped/failed: laggards catch up next run.
+          need_dhi=""; need_wolfi=""
           for v in $active; do
             cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
             dhi_have="$(echo "$cfg" | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty')"
-            if [ "$FORCE_ALL" = "true" ] || [ "$dhi_have" != "$dhi_now" ]; then
-              echo "-> $v: DHI re-stack (on ${dhi_have:-<missing>}, want ${dhi_now})"; need_dhi="$need_dhi $v"; fi
+            if [ "$FORCE_ALL" = "true" ] || [ "$dhi_have" != "$dhi_now" ]; then need_dhi="$need_dhi $v"; fi
             wolfi_have="$(base_of "${img}:${v}-wolfi")"
-            if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then
-              echo "-> $v: Wolfi re-stack (on ${wolfi_have:-<missing>}, want ${wolfi_now})"; need_wolfi="$need_wolfi $v"; fi
+            if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then need_wolfi="$need_wolfi $v"; fi
             # edition/arch coverage drift (read from the existing DHI image) -> rebuild both variants
             [ "$cfg" = '{}' ] && continue
             for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
               ed="${spec%%:*}"; gw="${spec##*:}"
               live="$(live_archs "${gw}:${v}")"; have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
-              [ "$live" != "$have" ] && { echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; need_dhi="$need_dhi $v"; need_wolfi="$need_wolfi $v"; }
+              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; need_dhi="$need_dhi $v"; need_wolfi="$need_wolfi $v"; fi
             done
           done
-          # (2) FROZEN: build once if the image is missing; never re-stacked on a base change.
+          # FROZEN: build once if the image is missing; never re-stacked on a base change.
           for v in $frozen; do
             crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image (frozen)";   need_dhi="$need_dhi $v"; }
             crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)"; need_wolfi="$need_wolfi $v"; }
           done
 
-          # dedupe + cap per run (MAX_DISPATCH spreads a big backfill / re-stack over days), dispatch.
-          dhi_uniq="$(echo $need_dhi     | tr ' ' '\n' | grep -E '^v' | sort -u | head -n "${MAX_DISPATCH}" || true)"
-          wolfi_uniq="$(echo $need_wolfi | tr ' ' '\n' | grep -E '^v' | sort -u | head -n "${MAX_DISPATCH}" || true)"
-          [ -n "$dhi_uniq$wolfi_uniq" ] || { echo "nothing to build"; exit 0; }
-          for v in $dhi_uniq;   do echo "dispatch DHI $v";   gh workflow run build.yml       -f gateway_version="$v" -f push=true || echo "WARN: dhi dispatch failed $v";   done
-          for v in $wolfi_uniq; do echo "dispatch Wolfi $v"; gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true || echo "WARN: wolfi dispatch failed $v"; done
+          # dedupe + OLDEST FIRST (sort -V) + cap (MAX_DISPATCH spreads a big backfill over days).
+          dhi_uniq="$(echo $need_dhi     | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
+          wolfi_uniq="$(echo $need_wolfi | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
+          echo "dhi_versions=$(echo $dhi_uniq)"     >> "$GITHUB_OUTPUT"
+          echo "wolfi_versions=$(echo $wolfi_uniq)" >> "$GITHUB_OUTPUT"
+          echo "to build: DHI=[$(echo $dhi_uniq)] WOLFI=[$(echo $wolfi_uniq)]"
+
+          # (C) Does the main package exist yet? If not, fan-out must seed ONE build first so the
+          #     package is created+linked serially (else N concurrent first-pushes race on creation).
+          if gh api "/users/${GHCR_NS}/packages/container/${IMAGE_NAME}" >/dev/null 2>&1; then
+            echo "main_missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "main_missing=true" >> "$GITHUB_OUTPUT"
+            echo "compile-tyk-plugin package absent -> first-seed (lone-first) guard active"
+          fi
+
+  # ---- 2. Build the stale base(s) ONCE, before any release fans out ----------
+  base:
+    needs: plan
+    if: ${{ needs.plan.outputs.base_variant != 'none' && !inputs.dry_run }}
+    uses: ./.github/workflows/build-base.yml
+    with:
+      variant: ${{ needs.plan.outputs.base_variant }}
+      glibc_target: "2.17"
+    secrets: inherit
+
+  # ---- 3. Fan out per-version release builds (they FROM the fresh base) ------
+  fanout:
+    needs: [plan, base]
+    # run after the base resolves; base may be 'skipped' (nothing stale) or 'success'
+    if: ${{ always() && needs.plan.result == 'success' && (needs.base.result == 'success' || needs.base.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch release builds (oldest first; lone-first on an empty package)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_MISSING: ${{ needs.plan.outputs.main_missing }}
+          BASE_VARIANT: ${{ needs.plan.outputs.base_variant }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          DHI_V: ${{ needs.plan.outputs.dhi_versions }}
+          WOLFI_V: ${{ needs.plan.outputs.wolfi_versions }}
+        run: |
+          set -euo pipefail
+          dhi="${DHI_V}"; wolfi="${WOLFI_V}"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY RUN - nothing built or dispatched."
+            echo "  stale base to rebuild : ${BASE_VARIANT}"
+            echo "  main package missing  : ${MAIN_MISSING}"
+            echo "  would dispatch DHI    : ${dhi:-<none>}"
+            echo "  would dispatch Wolfi  : ${wolfi:-<none>}"
+            exit 0
+          fi
+          if [ -z "${dhi}${wolfi}" ]; then echo "nothing to build"; exit 0; fi
+          if [ "$MAIN_MISSING" = "true" ]; then
+            first="$(printf '%s\n%s\n' $dhi $wolfi | grep -E '^v' | sort -uV | head -n1 || true)"
+            echo "FIRST SEED: compile-tyk-plugin package absent - dispatching ONE build (${first:-none}) to create+link it serially; the rest fan out next run (no creation race)."
+            if [ -n "$first" ]; then gh workflow run build.yml -f gateway_version="$first" -f push=true || echo "WARN: dispatch failed $first"; fi
+            exit 0
+          fi
+          for v in $dhi;   do echo "dispatch DHI $v";   gh workflow run build.yml       -f gateway_version="$v" -f push=true || echo "WARN: dhi dispatch failed $v";   done
+          for v in $wolfi; do echo "dispatch Wolfi $v"; gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true || echo "WARN: wolfi dispatch failed $v"; done
