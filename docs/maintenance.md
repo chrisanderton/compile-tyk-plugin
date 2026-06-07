@@ -154,10 +154,12 @@ The workflows need two pieces of configuration under Settings -> Secrets and var
 GHCR uses the built-in `GITHUB_TOKEN`. Each workflow's first job runs a preflight that
 fails fast if either value is unset (GitHub has no way to declare a variable `required`).
 
-- `GHCR_PRUNE_TOKEN` - an **optional** repository secret, needed only by `prune.yml`: a PAT
-  with `delete:packages` scope. The built-in `GITHUB_TOKEN` usually cannot delete *user-owned*
-  GHCR package versions, so without this the GHCR side of a prune logs a failure (Docker Hub
-  uses `DOCKERHUB_TOKEN`). Not needed if you do not run the pruner.
+- `GHCR_PRUNE_TOKEN` - an **optional** repository secret, needed only by `prune.yml`: a
+  **classic** PAT with the `delete:packages` scope (Settings -> Developer settings -> Personal
+  access tokens -> **Tokens (classic)**). Fine-grained PATs do not expose package scopes and
+  cannot delete GHCR container versions. The built-in `GITHUB_TOKEN` usually cannot delete
+  *user-owned* GHCR package versions either, so without this the GHCR side of a prune logs a
+  failure (Docker Hub uses `DOCKERHUB_TOKEN`). Not needed if you do not run the pruner.
 
 To create the token: Docker Hub - Account settings - Personal access tokens - Generate
 new token.

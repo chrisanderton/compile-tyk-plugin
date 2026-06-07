@@ -12,8 +12,9 @@ name: prune
 #
 # Because it enforces a REVIEWED file (not an inference), it is safe to run unattended. Editing
 # releases.yml is the deprecation decision; this just applies it. Still: run once with dry_run=true
-# to preview. GHCR deletion needs delete:packages - set secret GHCR_PRUNE_TOKEN to a PAT with that
-# scope (GITHUB_TOKEN usually 403s on user-owned packages; the run logs it clearly).
+# to preview. GHCR deletion needs delete:packages - set secret GHCR_PRUNE_TOKEN to a CLASSIC PAT
+# with that scope (Tokens (classic); fine-grained PATs lack package scopes). GITHUB_TOKEN usually
+# 403s on user-owned packages; the run logs it clearly.
 
 on:
   schedule:
