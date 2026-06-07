@@ -1,0 +1,33 @@
+# Support policy for the Tyk plugin compiler - the SINGLE source of truth.
+# The watcher (builds + base-CVE re-stacks) and the pruner (registry retention) act on EXACTLY
+# this file. Editing it - via reviewed PR - is how you change what is built, patched, and kept.
+# A version's lifecycle = moving it between the classes below: maintained -> retired -> deleted.
+
+# Per maintained line, the newest N point releases get ongoing base-CVE updates; older patches of
+# the line are kept but frozen (built once, no further base updates).
+patch_depth: 3
+
+# Immutable dated snapshots (:vX.Y.Z-YYYYMMDD) of ACTIVELY-updated versions are kept this many
+# days, then trimmed. Frozen and retired versions keep only their single latest snapshot.
+snapshot_retention_days: 14
+
+# MAINTAINED - whole minor lines (latest, LTS, LTS-1). EVERY patch of these lines gets a builder;
+# the newest `patch_depth` patches stay base-CVE-current, the rest freeze (kept, not updated).
+maintained:
+  - "5.13"   # latest
+  - "5.8"    # LTS
+  - "5.3"    # LTS-1
+
+# MAINTAINED_EXTRA - specific one-off versions to keep ACTIVE (base-CVE-updated) even though their
+# line is not in `maintained` - e.g. a key customer pinned to it. Exact versions only (vX.Y.Z).
+maintained_extra:
+  - "v5.0.13"
+
+# RETIRED - out of support, kept available ONLY so a customer can build to upgrade off them.
+# Frozen (no base updates); only the latest snapshot retained. Two forms:
+#   - a whole line  "5.2"     -> keep ONLY that line's final patch (its tip)
+#   - a specific    "v5.1.4"  -> keep exactly that version
+# Anything not in maintained / maintained_extra / retired is deleted by the pruner.
+retired: []
+  # - "5.2"
+  # - "v5.1.4"

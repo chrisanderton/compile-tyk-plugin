@@ -164,9 +164,15 @@ base/release split; what auto-adapts vs. needs a maintainer): **`docs/maintenanc
 | Tag | Meaning |
 |---|---|
 | `:vX.Y.Z` | default (DHI base), multi-arch (amd64+arm64); moving - always the latest patched build |
-| `:vX.Y.Z-YYYYMMDD` | immutable, for pinning |
+| `:vX.Y.Z-YYYYMMDD` | immutable snapshot, for reproducible pinning (retained ~14 days; see `SUPPORT.md`) |
 | `:vX.Y.Z-wolfi` | Wolfi/Chainguard base variant (amd64+arm64 native only; see below) |
+| `:vX.Y.Z-glibc2.31` | opt-in higher glibc floor (2.31; default is 2.17/RHEL 7) - not RHEL 7 compatible |
 | `-base:latest` | the stable toolchain/sysroot base layer |
+
+**Which versions exist, and for how long**, is declared in [`releases.yml`](releases.yml) and
+documented in [`SUPPORT.md`](SUPPORT.md): the newest patches of the latest + LTS + LTS-1 lines are
+kept base-CVE-current; older/retired versions are frozen-but-available. Track the moving `:vX.Y.Z`
+for currency; pin `:vX.Y.Z-YYYYMMDD` or a digest for reproducibility.
 
 ### Wolfi variant (for Chainguard shops)
 A second base is published from `build-wolfi.yml` as `:vX.Y.Z-wolfi` for teams

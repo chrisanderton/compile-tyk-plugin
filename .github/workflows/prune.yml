@@ -1,0 +1,128 @@
+name: prune
+
+# Enforce the support policy (releases.yml) on the registry footprint of the compile-tyk-plugin
+# package (GHCR + Docker Hub). It resolves the SAME ACTIVE/FROZEN sets the watcher builds (via
+# scripts/resolve-releases.sh) and keeps exactly that, with these retention rules:
+#   * out-of-policy version   -> delete ALL its tags (e.g. a patch that aged out of a maintained
+#                                line, or a line moved to `retired` so only its tip is kept)
+#   * kept version, moving tag (:vX.Y.Z[/-wolfi]) -> always kept
+#   * kept ACTIVE version, dated snapshots (:...-YYYYMMDD) -> keep those within snapshot_retention_days
+#   * kept FROZEN version, dated snapshots               -> keep only the newest one
+# Never touches *-glibc2.31 opt-in tags, the -base/-base-wolfi packages, or buildcache.
+#
+# Because it enforces a REVIEWED file (not an inference), it is safe to run unattended. Editing
+# releases.yml is the deprecation decision; this just applies it. Still: run once with dry_run=true
+# to preview. GHCR deletion needs delete:packages - set secret GHCR_PRUNE_TOKEN to a PAT with that
+# scope (GITHUB_TOKEN usually 403s on user-owned packages; the run logs it clearly).
+
+on:
+  schedule:
+    - cron: "41 7 * * 1"            # Mondays ~07:41 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only - list what would be deleted, delete nothing"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: compile-tyk-plugin
+  GHCR_NS: ${{ github.repository_owner }}
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: imjasonh/setup-crane@v0.4
+      - name: Check required config
+        env:
+          DH_USER: ${{ vars.DOCKERHUB_USER }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          [ -n "$DH_USER" ]  || { echo "::error::Set repository VARIABLE DOCKERHUB_USER."; exit 1; }
+          [ -n "$DH_TOKEN" ] || { echo "::error::Set repository SECRET DOCKERHUB_TOKEN (Read/Write PAT)."; exit 1; }
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with: { username: "${{ vars.DOCKERHUB_USER }}", password: "${{ secrets.DOCKERHUB_TOKEN }}" }
+
+      - name: Resolve policy + prune
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PRUNE_TOKEN || github.token }}
+          DH_USER: ${{ vars.DOCKERHUB_USER }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DH_NS: ${{ vars.DOCKERHUB_USER }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          SOURCE_REPO: TykTechnologies/tyk
+          GW_CE_REPO: tykio/tyk-gateway
+        run: |
+          set -euo pipefail
+          PKG="$IMAGE_NAME"
+          MOV_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-wolfi)?$'
+          DAT_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-wolfi)?-[0-9]{8}$'
+
+          # --- the policy: ACTIVE / FROZEN / retention, from the shared resolver ---
+          resolved="$(GW_CE_REPO="$GW_CE_REPO" SOURCE_REPO="$SOURCE_REPO" bash scripts/resolve-releases.sh)"
+          active="$(printf '%s\n' "$resolved" | awk '$1=="ACTIVE"{print $2}')"
+          frozen="$(printf '%s\n' "$resolved" | awk '$1=="FROZEN"{print $2}')"
+          ret_days="$(printf '%s\n' "$resolved" | awk '$1=="SETTING"&&$2=="snapshot_retention_days"{print $3}')"
+          keep="$(printf '%s\n' $active $frozen | grep -E '^v' | sort -uV | uniq || true)"
+          [ -n "$keep" ] || { echo "::error::empty keep-set from policy - aborting (nothing pruned)"; exit 1; }
+          cutoff="$(date -u -d "${ret_days} days ago" +%Y%m%d 2>/dev/null || date -u -v-"${ret_days}"d +%Y%m%d)"
+          echo "keep: $(echo $keep|wc -w) versions ($(echo $active|wc -w) active / $(echo $frozen|wc -w) frozen); snapshot cutoff ${cutoff} (${ret_days}d)"
+
+          # --- all managed tags across both registries ---
+          ghcr_tags="$(gh api --paginate "/users/${GHCR_NS}/packages/container/${PKG}/versions" -q '.[].metadata.container.tags[]' 2>/dev/null | sort -u || true)"
+          dh_jwt="$(curl -s -H 'Content-Type: application/json' -d "{\"username\":\"${DH_USER}\",\"password\":\"${DH_TOKEN}\"}" https://hub.docker.com/v2/users/login/ | jq -r '.token // empty')"
+          dh_tags="$(curl -s -H "Authorization: JWT ${dh_jwt}" "https://hub.docker.com/v2/repositories/${DH_NS}/${PKG}/tags/?page_size=1000" | jq -r '.results[]?.name' 2>/dev/null | sort -u || true)"
+          all_tags="$(printf '%s\n%s\n' "$ghcr_tags" "$dh_tags" | sort -u | grep -E "$MOV_RE|$DAT_RE" || true)"
+          [ -n "$all_tags" ] || { echo "no managed tags found (registry read failed?) - aborting, nothing pruned"; exit 0; }
+
+          # --- decide per tag ---
+          del_list=""
+          for t in $all_tags; do
+            ver="$(printf '%s' "$t" | sed -E 's/^(v[0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+            rest="${t#"$ver"}"; variant=""; case "$rest" in -wolfi*) variant="-wolfi";; esac
+            date="$(printf '%s' "$t" | grep -oE '[0-9]{8}$' || true)"
+            if ! printf '%s\n' "$keep" | grep -qx "$ver"; then del_list="$del_list $t"; continue; fi   # out of policy
+            [ -z "$date" ] && continue                                                                  # moving tag of a kept version: keep
+            if printf '%s\n' "$active" | grep -qx "$ver"; then
+              [ "$date" -lt "$cutoff" ] && del_list="$del_list $t"                                      # ACTIVE: older than window
+            else
+              newest="$(printf '%s\n' "$all_tags" | grep -E "^${ver}${variant}-[0-9]{8}$" | sort | tail -1)"
+              [ "$t" != "$newest" ] && del_list="$del_list $t"                                          # FROZEN: keep newest snapshot only
+            fi
+          done
+          del_list="$(printf '%s\n' $del_list | sort -u | grep -E "$MOV_RE|$DAT_RE" || true)"
+
+          if [ -z "$del_list" ]; then echo "nothing to prune."; exit 0; fi
+          # guard: never delete a moving tag of a KEPT version (defends a logic bug)
+          for t in $del_list; do
+            v="$(printf '%s' "$t" | sed -E 's/^(v[0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+            if printf '%s' "$t" | grep -qE "$MOV_RE" && printf '%s\n' "$keep" | grep -qx "$v"; then
+              echo "::error::refusing to delete moving tag '$t' of a kept version - aborting"; exit 1; fi
+          done
+          echo "=== delete ($(echo $del_list|wc -w)) ==="; printf '  %s\n' $del_list
+
+          if [ "$DRY_RUN" = "true" ]; then echo "DRY RUN - nothing deleted."; exit 0; fi
+
+          # --- delete: Docker Hub by tag; GHCR by version id ---
+          gh api --paginate "/users/${GHCR_NS}/packages/container/${PKG}/versions" -q '.[] | [.id] + .metadata.container.tags | @tsv' 2>/dev/null > /tmp/ghcr.tsv || true
+          ghcr_fail=0
+          for t in $del_list; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: JWT ${dh_jwt}" "https://hub.docker.com/v2/repositories/${DH_NS}/${PKG}/tags/${t}/")"
+            echo "  dockerhub ${t}: HTTP ${code}"
+            id="$(awk -v tag="$t" -F'\t' '{for(i=2;i<=NF;i++) if($i==tag){print $1; exit}}' /tmp/ghcr.tsv || true)"
+            if [ -n "$id" ]; then
+              gh api --method DELETE "/users/${GHCR_NS}/packages/container/${PKG}/versions/${id}" >/dev/null 2>&1 \
+                && echo "  ghcr      ${t} (id ${id}): ok" \
+                || { echo "  ghcr      ${t} (id ${id}): FAILED (need GHCR_PRUNE_TOKEN with delete:packages?)"; ghcr_fail=1; }
+            fi
+          done
+          [ "$ghcr_fail" = 0 ] || echo "::warning::some GHCR deletions failed - see above"
+          echo "prune complete."

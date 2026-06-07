@@ -1,20 +1,17 @@
 name: watch
 
-# Auto-rebuild triggers (external - we watch from the outside):
-#   * ACTIVE GATEWAY LINE  -> build the compiler for it. Candidate versions are the
-#                            proper-semver git tags that ALSO have a published gateway
-#                            image (git tags INTERSECT registry tags). GitHub Releases
-#                            are NOT used: Tyk's release objects are inconsistent (e.g.
-#                            v5.13.0 ships a tag + image but has no Release; some RCs are
-#                            flagged prerelease=false). From the candidates we keep the
-#                            TIP of each line patched within activity_days, plus the
-#                            latest release - this tracks "latest + active LTS" with no
-#                            hand-maintained list (a non-LTS line stops getting tags at
-#                            EOL; an LTS keeps getting them ~24 months).
-#   * NEW DHI BASE DIGEST  -> re-stack (CVE patch) ALL maintained versions on the
-#                            fresh base, even with no Gateway change.
-# Tune discovery with activity_days (first-run seed: 30) and the re-stack with
-# maintain_last. See docs/maintenance.md.
+# What to build/maintain is declared in releases.yml (the support policy) and resolved by
+# scripts/resolve-releases.sh into ACTIVE (base-CVE-updated) + FROZEN (built once, kept) sets,
+# intersected with buildable Gateway versions (git tag AND published image). This watcher acts on
+# that, prune.yml enforces the same policy on the registry - one source of truth, no drift.
+#
+# Triggers:
+#   * MISSING IMAGE     -> build it (new gateway release, or first-run backfill of a maintained
+#                          line's older/frozen patches). Both DHI + Wolfi.
+#   * EDITION/ARCH DRIFT -> rebuild (ACTIVE only; e.g. an edition gains s390x).
+#   * NEW BASE DIGEST   -> re-stack the ACTIVE set on the fresh base. DHI and Wolfi bases are
+#                          watched INDEPENDENTLY (a DHI change re-stacks DHI only; Wolfi -> Wolfi).
+# Editions ce/ee/ee-fips all ship from one image per version. See docs/maintenance.md + SUPPORT.md.
 
 on:
   schedule:
@@ -26,16 +23,11 @@ on:
         required: false
         type: boolean
         default: false
-      maintain_last:
-        description: "On a base change, re-stack only the N most recent published versions (0 = all)"
+      max_dispatch:
+        description: "Cap builds dispatched per run (throttles the first-run backfill; raise for faster catch-up)"
         required: false
         type: string
-        default: "0"
-      activity_days:
-        description: "Maintain the tip of each line whose latest image is younger than N days (+ always the latest release). First-run seed: 30 (latest + active LTS only)."
-        required: false
-        type: string
-        default: "120"
+        default: "12"
 
 permissions:
   contents: read
@@ -45,6 +37,7 @@ permissions:
 env:
   IMAGE_NAME: compile-tyk-plugin
   DHI_BASE: dhi.io/debian-base:trixie-debian13-dev
+  WOLFI_BASE: cgr.dev/chainguard/wolfi-base:latest
   GHCR_NS: ${{ github.repository_owner }}
 
 jobs:
@@ -82,8 +75,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_ALL: ${{ inputs.force_all || 'false' }}
-          MAINTAIN_LAST: ${{ inputs.maintain_last || '0' }}
-          ACTIVITY_DAYS: ${{ inputs.activity_days || '120' }}
+          MAX_DISPATCH: ${{ inputs.max_dispatch || '12' }}
           SOURCE_REPO: TykTechnologies/tyk
           GW_CE_REPO: tykio/tyk-gateway
         run: |
@@ -99,93 +91,59 @@ jobs:
           [ "$dhi_now" != "$dhi_last" ] && dhi_changed=true
           echo "DHI now=$dhi_now last=${dhi_last:-<none>} changed=$dhi_changed"
 
-          # All editions (oss / ee / fips) ship from the SAME commit under the SAME
-          # version tag, so one compiler per version covers all three (OSS+EE by
-          # default, FIPS via EDITION=ee-fips).
-          # Maintained set = proper-release versions already published to OUR registry
-          # (no manual file). MAINTAIN_LAST caps to the N most recent (0 = all).
-          published="$(crane ls "$img" 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV || true)"
-          if [ "${MAINTAIN_LAST:-0}" -gt 0 ] 2>/dev/null; then
-            maintained="$(echo "$published" | tail -n "$MAINTAIN_LAST")"
-          else
-            maintained="$published"
-          fi
+          # --- has the WOLFI base changed since we last built our wolfi base? ---
+          # (Independent from DHI: the two bases update on their own schedules. The wolfi base
+          # records its source digest in the same io.ctp.dhi-base-digest label.)
+          wbase_ref="ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base-wolfi:latest"
+          wolfi_now="$(crane digest "${WOLFI_BASE}")"
+          wolfi_last="$(crane config "$wbase_ref" 2>/dev/null \
+                        | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty' || true)"
+          wolfi_changed=false
+          [ "$wolfi_now" != "$wolfi_last" ] && wolfi_changed=true
+          echo "WOLFI now=$wolfi_now last=${wolfi_last:-<none>} changed=$wolfi_changed"
 
-          # --- discover buildable Gateway versions: git tags INTERSECT registry tags ---
-          # A version is buildable only if it exists BOTH as a proper-semver git tag
-          # (its source can be vendored) AND as a published gateway image (it can be
-          # resolved + gated). Cross-checking both is the reliable source of truth; the
-          # GitHub Releases API is inconsistent (no v5.13.0 object; some RCs mislabelled
-          # prerelease=false). The ^vX.Y.Z$ regex drops every rc/alpha/beta regardless.
-          SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$'
-          git_tags="$(git ls-remote --tags --refs "https://github.com/${SOURCE_REPO}.git" 2>/dev/null \
-                      | sed 's#.*refs/tags/##' | grep -E "$SEMVER" | sort -uV || true)"
-          reg_tags="$(crane ls "$GW_CE_REPO" 2>/dev/null | grep -E "$SEMVER" | sort -uV || true)"
-          # intersection: git tags that are also published images (empty reg/git -> empty).
-          # Temp files (not <(...) process substitution) so it is shell-agnostic.
-          gt="$(mktemp)"; rt="$(mktemp)"
-          printf '%s\n' "$git_tags" > "$gt"; printf '%s\n' "$reg_tags" > "$rt"
-          buildable="$(grep -Fxf "$rt" "$gt" | sort -uV || true)"
-          rm -f "$gt" "$rt"
-          # Select what to maintain by ACTIVITY, not by raw version rank. Tyk's LTS
-          # policy means the supported set is "the latest release + the active LTS
-          # lines" - and those are exactly the lines still receiving patches. A non-LTS
-          # minor is EOL the moment its successor ships, so it stops getting tags; an
-          # LTS keeps getting them for ~24 months. So: keep the TIP (highest patch) of
-          # each minor line whose tip image was published within ACTIVITY_DAYS, plus
-          # always the single latest release. No hand-maintained LTS list.
-          latest="$(printf '%s\n' "$buildable" | tail -n 1 || true)"
-          cutoff="$(date -u -d "${ACTIVITY_DAYS} days ago" +%F 2>/dev/null \
-                    || date -u -v-"${ACTIVITY_DAYS}"d +%F)"
-          minors="$(printf '%s\n' "$buildable" | sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/' | sort -uV | uniq)"
-          active=""
-          for m in $minors; do
-            tip="$(printf '%s\n' "$buildable" | grep -E "^v${m}\." | sort -V | tail -n 1)"
-            created="$(crane config "${GW_CE_REPO}:${tip}" 2>/dev/null | jq -r '.created // empty' | cut -dT -f1)"
-            [ -z "$created" ] && continue
-            # keep if created >= cutoff (awk does the ISO-date compare portably)
-            if awk -v a="$created" -v b="$cutoff" 'BEGIN{exit !(a>=b)}'; then
-              active="$active $tip"; echo "  active line ${m}: ${tip} (image ${created} >= ${cutoff})"
-            fi
+          # Editions (ce/ee/fips) all ship from ONE image per version. Resolve releases.yml (the
+          # support policy) into the concrete sets: ACTIVE = base-CVE-updated (moving tag re-stacked,
+          # snapshots kept); FROZEN = built once and kept, no further base updates. Build set =
+          # ACTIVE + FROZEN. Only ACTIVE is re-stacked on a base change. One source of truth, shared
+          # with prune.yml, so they cannot drift.
+          resolved="$(GW_CE_REPO="$GW_CE_REPO" SOURCE_REPO="$SOURCE_REPO" bash scripts/resolve-releases.sh)"
+          active="$(printf '%s\n' "$resolved" | awk '$1=="ACTIVE"{print $2}')"
+          frozen="$(printf '%s\n' "$resolved" | awk '$1=="FROZEN"{print $2}')"
+          build_set="$(printf '%s\n' $active $frozen | grep -E '^v' | sort -uV | uniq || true)"
+          [ -n "$build_set" ] || { echo "::error::empty policy set (resolve-releases failed?) - aborting"; exit 1; }
+          echo "policy: $(printf '%s\n' $active|grep -c .) active, $(printf '%s\n' $frozen|grep -c .) frozen ($(printf '%s\n' $build_set|grep -c .) kept)"
+
+          # Decisions are per-variant (DHI / Wolfi independent). Gateway-driven work (new image /
+          # arch drift) applies to both; base-CVE re-stacks only to the variant whose base moved.
+          live_archs() { crane manifest "$1" 2>/dev/null \
+            | jq -r '[.manifests[]?|select((.platform.os//"")=="linux" and (.platform.architecture//"")!="unknown")|.platform.architecture]|sort|unique|join(",")' 2>/dev/null || true; }
+          need_dhi=""; need_wolfi=""
+
+          # (1) Build any KEPT version (ACTIVE or FROZEN) that has no image yet - new releases plus
+          #     the one-time backfill of a maintained line's older patches. Per variant.
+          for v in $build_set; do
+            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image";   need_dhi="$need_dhi $v"; }
+            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image"; need_wolfi="$need_wolfi $v"; }
           done
-          # maintained-to-build = active line tips UNION the latest release, deduped
-          recent="$(printf '%s\n' $active "$latest" | grep -E "$SEMVER" | sort -uV | uniq || true)"
-          echo "discovery (active within ${ACTIVITY_DAYS}d + latest=${latest}):"
-          printf '%s\n' "$recent" | sed 's/^/  /'
-
-          build_set=""
-          for v in $recent; do
-            if ! crane manifest "${img}:${v}" >/dev/null 2>&1; then
-              echo "-> new release $v (no compiler image yet)"; build_set="$build_set $v"; continue
-            fi
-            # Edition + ARCH coverage: compare each edition Gateway's live published
-            # architectures to what the compiler recorded (io.ctp.<ed>-archs). Any drift -
-            # a new edition appearing, OR an edition gaining an arch (e.g. s390x
-            # EE/FIPS) - triggers a rebuild that picks it up automatically.
-            live_archs() { crane manifest "$1" 2>/dev/null \
-              | jq -r '[.manifests[]?|select((.platform.os//"")=="linux" and (.platform.architecture//"")!="unknown")|.platform.architecture]|sort|unique|join(",")' 2>/dev/null || true; }
+          # (2) Edition/arch drift (e.g. an edition gains s390x) -> rebuild. ACTIVE only - FROZEN
+          #     versions are deliberately not refreshed.
+          for v in $active; do
             cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
+            [ "$cfg" = '{}' ] && continue   # not built yet; step (1) covers it
             for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
               ed="${spec%%:*}"; gw="${spec##*:}"
-              live="$(live_archs "${gw}:${v}")"
-              have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
-              if [ "$live" != "$have" ]; then
-                echo "-> $v: $ed architectures changed ('${have}' -> '${live}') - rebuild"; build_set="$build_set $v"
-              fi
+              live="$(live_archs "${gw}:${v}")"; have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
+              [ "$live" != "$have" ] && { echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; need_dhi="$need_dhi $v"; need_wolfi="$need_wolfi $v"; }
             done
           done
-          # DHI changed (or forced): re-stack all maintained versions on the new base
-          if [ "$dhi_changed" = "true" ] || [ "$FORCE_ALL" = "true" ]; then
-            echo "-> DHI base changed/forced - re-stacking maintained versions"
-            build_set="$build_set $maintained"
-          fi
+          # (3) Base CVE re-stack -> ACTIVE set only, independent per variant.
+          if [ "$dhi_changed" = "true" ]   || [ "$FORCE_ALL" = "true" ]; then echo "-> DHI base changed/forced - re-stack ACTIVE";   need_dhi="$need_dhi $active"; fi
+          if [ "$wolfi_changed" = "true" ] || [ "$FORCE_ALL" = "true" ]; then echo "-> Wolfi base changed/forced - re-stack ACTIVE"; need_wolfi="$need_wolfi $active"; fi
 
-          # dedupe + dispatch
-          uniq="$(echo $build_set | tr ' ' '\n' | grep -E '^v' | sort -u || true)"
-          if [ -z "$uniq" ]; then echo "nothing to build"; exit 0; fi
-          # Build both variants in lockstep: the default (DHI) and the Wolfi build.
-          for v in $uniq; do
-            echo "dispatching builds for $v (dhi + wolfi)"
-            gh workflow run build.yml       -f gateway_version="$v" -f push=true || echo "WARN: dhi dispatch failed for $v"
-            gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true || echo "WARN: wolfi dispatch failed for $v"
-          done
+          # dedupe + cap per run (MAX_DISPATCH spreads a big first-run backfill over days), dispatch.
+          dhi_uniq="$(echo $need_dhi     | tr ' ' '\n' | grep -E '^v' | sort -u | head -n "${MAX_DISPATCH}" || true)"
+          wolfi_uniq="$(echo $need_wolfi | tr ' ' '\n' | grep -E '^v' | sort -u | head -n "${MAX_DISPATCH}" || true)"
+          [ -n "$dhi_uniq$wolfi_uniq" ] || { echo "nothing to build"; exit 0; }
+          for v in $dhi_uniq;   do echo "dispatch DHI $v";   gh workflow run build.yml       -f gateway_version="$v" -f push=true || echo "WARN: dhi dispatch failed $v";   done
+          for v in $wolfi_uniq; do echo "dispatch Wolfi $v"; gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true || echo "WARN: wolfi dispatch failed $v"; done
