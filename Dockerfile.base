@@ -95,6 +95,9 @@ RUN set -eux; \
       for l in $(find "$SR/usr/lib" -maxdepth 1 -type l 2>/dev/null || true); do \
         t="$(readlink "$l")"; case "$t" in *lib64/*) ln -sf "$(basename "$t")" "$l" ;; esac; \
       done; \
+      # drop any STILL-dangling symlinks - leftover non-glibc manylinux cruft (cracklib/nss/dbus/ \
+      # p11-kit); safe because the glibc dev links were just repointed and now resolve. \
+      find "$SR" -xtype l -delete 2>/dev/null || true; \
       # the loader is runtime-only (a -buildmode=plugin .so has no interp) - best-effort, deref symlinks \
       cp -aL "/ml/${arch}/lib/${loader}" "$SR/lib/${loader}" 2>/dev/null || true; \
       # rewrite GROUP/AS_NEEDED absolute paths in the REAL ld scripts only (OUTPUT_FORMAT marks them) \
