@@ -45,6 +45,8 @@ tasks:
         docker build -f Dockerfile.release \
           --build-arg BASE_IMAGE={{.IMAGE}}-base:local \
           --build-arg GO_VERSION="$GO_VERSION" \
+          --build-arg GATEWAY_TRIMPATH="$GATEWAY_TRIMPATH" \
+          --build-arg GATEWAY_SRC_ROOT="$GATEWAY_SRC_ROOT" \
           --build-arg GO_SHA256_amd64="$GO_SHA256_amd64" \
           --build-arg GO_SHA256_arm64="$GO_SHA256_arm64" \
           --build-arg GITHUB_SHA="$GITHUB_SHA" --build-arg GITHUB_TAG="$GITHUB_TAG" \

@@ -23,12 +23,17 @@ git clone https://github.com/myorg/tyk && cd tyk && git checkout my-ref
 docker build -f /path/to/compile-tyk-plugin/Dockerfile.release \
   --build-arg BASE_IMAGE=ghcr.io/<you>/compile-tyk-plugin-base:latest \
   --build-arg GO_VERSION=go1.25.10 \
+  --build-arg GATEWAY_TRIMPATH=true \
+  --build-arg GATEWAY_SRC_ROOT= \
   --build-arg GO_SHA256_amd64=<sha> --build-arg GO_SHA256_arm64=<sha> \
   --build-arg GITHUB_SHA=$(git rev-parse HEAD) \
   --build-arg GITHUB_TAG=my-ref \
   -t my-compile-tyk-plugin:my-ref .          # build context = your Gateway checkout
 ```
 - `GO_VERSION` must equal the Go your Gateway is built with (`go version -m your-gateway-binary`).
+- `GATEWAY_TRIMPATH` and `GATEWAY_SRC_ROOT` must match the Gateway build. Use
+  `scripts/resolve-gateway.sh` whenever possible; older GOPATH-built Gateways such as
+  `v5.0.x` need these values for `plugin.Open` compatibility.
 - If your Gateway uses extra build tags (e.g. `ee`, custom): `--build-arg BUILD_TAG=ee,whatever`.
 - For FIPS: `--build-arg FIPS_AVAILABLE=true --build-arg FIPS_GOFIPS140=v1.0.0 --build-arg FIPS_BUILD_TAG=ee,fips` (then `-e FIPS=1` at use).
 - The base image is generic - pull the published one or build it yourself once (`Dockerfile.base`).
@@ -40,7 +45,8 @@ If you publish your custom Gateway image, the resolver reads the Go version + co
 GATEWAY_REPO=myorg/my-tyk-gateway \
 GATEWAY_FIPS_REPO=myorg/my-tyk-gateway-fips \
   ./scripts/resolve-gateway.sh my-ref
-# emits GO_VERSION / GITHUB_SHA / GO_SHA256_* / FIPS_* to feed into the build above.
+# emits GO_VERSION / GITHUB_SHA / GATEWAY_TRIMPATH / GATEWAY_SRC_ROOT /
+# GO_SHA256_* / FIPS_* to feed into the build above.
 ```
 (Your image must carry the standard `org.opencontainers.image.revision` label and a
 Go-built `/opt/tyk-gateway/tyk` binary - both true for images built the Tyk way.)

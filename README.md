@@ -34,6 +34,9 @@ chosen specifically for the plugin-compilation job.
 ---
 
 ## Quick start - build a plugin
+Most users should use a published compiler image tag for the Gateway version they run.
+Build this repo yourself only for a custom/self-built Gateway or maintainer work.
+
 ```bash
 docker run --rm -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so
 # -> writes my-plugin_vX.Y.Z_linux_<goarch>.so into the mounted directory
