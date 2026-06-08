@@ -21,9 +21,12 @@ PLUGDIR="$HERE/loadtest/test-plugin"
 
 archenv=(); platform=()
 if [ -n "$GOARCH" ]; then archenv=(-e GOARCH="$GOARCH"); platform=(--platform "linux/$GOARCH"); fi
-echo "== gate: building test-plugin with $COMPILER (EDITION=$EDITION GOARCH=${GOARCH:-native}) =="
+# Optional: pin the COMPILER's own runtime platform (e.g. exercise the amd64 image under QEMU on an
+# arm64 host). Default empty = run the compiler on the host's native arch. CI never sets it.
+cplat=(); [ -n "${COMPILER_PLATFORM:-}" ] && cplat=(--platform "$COMPILER_PLATFORM")
+echo "== gate: building test-plugin with $COMPILER (EDITION=$EDITION GOARCH=${GOARCH:-native} compiler=${COMPILER_PLATFORM:-native}) =="
 rm -f "$PLUGDIR"/*.so
-docker run --rm -e EDITION="$EDITION" ${archenv[@]+"${archenv[@]}"} -v "$PLUGDIR:/plugin-source" "$COMPILER" plugin.so
+docker run --rm -e EDITION="$EDITION" ${archenv[@]+"${archenv[@]}"} ${cplat[@]+"${cplat[@]}"} -v "$PLUGDIR:/plugin-source" "$COMPILER" plugin.so
 SO="$(ls "$PLUGDIR"/plugin_*_linux_*.so | head -1)"
 [ -f "$SO" ] || { echo "GATE FAIL: compiler produced no .so"; exit 1; }
 
