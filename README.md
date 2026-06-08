@@ -1,21 +1,27 @@
 # compile-tyk-plugin
 
-A modern, low-CVE, **multi-arch** compiler for Tyk Go plugins - built to match **any
-Tyk Gateway release and edition**, with the **same Docker workflow** as the official
-`tyk-plugin-compiler`.
+A prebuilt, low-CVE, **multi-arch** Docker image set for compiling Tyk Go plugins.
+Use it as a drop-in replacement for the official `tyk-plugin-compiler`: same
+`docker run` shape, same output naming, but with native amd64/arm64 images and a
+focused plugin-builder base.
 
 > **Community / unofficial.** Not affiliated with or supported by Tyk. It consumes only
-> public Tyk artifacts and publishes to *your own* registry namespace.
+> public Tyk artifacts.
 
-Give it a Gateway version; it figures out the rest (exact Go toolchain, commit, FIPS/EE
-settings) from the published Gateway image and produces a matching compiler.
+For normal use, you do **not** build this repository. Pick the prebuilt image tag that
+matches your Gateway version, then run it against your plugin source.
 
 What it gives you:
+- **Prebuilt per Gateway release** - tags such as `v5.13.0` already contain the exact
+  Go toolchain, Gateway source, dependency graph, edition flags, and FIPS settings for
+  that Gateway.
+- **Drop-in compiler interface** - mount your plugin source at `/plugin-source` and pass
+  the output name, just like `tykio/tyk-plugin-compiler`.
+- **Native amd64 + arm64 images** - no `--platform=linux/amd64` needed on Apple Silicon
+  or arm64 Linux runners.
 - **Docker Hardened Image base** - hardened, minimal, continuously patched. In our
   measurements this means far fewer CVE-scanner findings (about 85-90% fewer
   CRITICAL/HIGH).
-- **Native multi-arch builds** - amd64 and arm64 images each run on their own
-  architecture, with no emulation (including on Apple Silicon), so builds are faster.
 - **One image, many targets** - cross-compiles amd64/arm64/s390x and builds for the
   **CE / EE / EE-FIPS** editions, all selected with a flag.
 - **Old-glibc CGO compatibility as an isolated link sysroot** - plugins link against a
@@ -27,18 +33,37 @@ general-purpose Gateway release builder that does more than compile plugins, so 
 package-count or CVE comparison is not apples-to-apples; the figures above reflect a base
 chosen specifically for the plugin-compilation job.
 
-`vX.Y.Z` below is any published Gateway version (examples use `v5.13.0`). Replace
-`compile-tyk-plugin` with your published image, e.g. `youruser/compile-tyk-plugin` or
-`ghcr.io/youruser/compile-tyk-plugin`.
+Examples below use Docker Hub image `chrisanderton/compile-tyk-plugin`. Replace that
+with your internal mirror if you copy the images into a private registry.
 
 ---
 
-## Quick start - build a plugin
-Most users should use a published compiler image tag for the Gateway version they run.
-Build this repo yourself only for a custom/self-built Gateway or maintainer work.
+## Pick a prebuilt image
+Use the compiler tag that matches the Gateway version and base variant you want.
+Docker automatically pulls the native amd64 or arm64 image for your host.
+
+| Compiler tag | Use when |
+|---|---|
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z` | Default choice. DHI-based, amd64+arm64 image, cross-targets amd64/arm64/s390x. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi` | Wolfi/Chainguard base. Native amd64/arm64 only; no s390x cross target. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-YYYYMMDD` | Immutable snapshot of the default tag for reproducible builds. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi-YYYYMMDD` | Immutable snapshot of the Wolfi tag. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-glibc2.31` | Opt-in higher glibc floor for plugins that need newer libc symbols. Not RHEL 7 compatible. |
+
+`vX.Y.Z` is your Tyk Gateway version, for example `v5.13.0`.
 
 ```bash
-docker run --rm -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so
+docker pull chrisanderton/compile-tyk-plugin:v5.13.0
+```
+
+Published-version policy and retention are documented in [`SUPPORT.md`](SUPPORT.md).
+
+## Quick start
+From your plugin source directory:
+
+```bash
+docker run --rm -v "$PWD:/plugin-source" \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
 # -> writes my-plugin_vX.Y.Z_linux_<goarch>.so into the mounted directory
 ```
 Same interface as the official compiler - only the image name changes.
@@ -65,11 +90,17 @@ Output naming matches the official convention: `{name}_{Gw-version}_{GOOS}_{GOAR
 One image carries glibc sysroots + cross toolchains for **amd64, arm64, s390x**, so any
 target builds via `GOARCH` regardless of host:
 ```bash
-docker run --rm -e GOARCH=arm64 -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so
-docker run --rm -e GOARCH=s390x -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so  # big-endian, CE only
+docker run --rm -e GOARCH=arm64 -v "$PWD:/plugin-source" \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
+
+docker run --rm -e GOARCH=s390x -v "$PWD:/plugin-source" \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so  # big-endian, CE only
 ```
 The compiler image itself is published amd64 + arm64 (native on each); s390x is a
 cross target. Prefer the native image of the target arch for CGO-heavy plugins.
+
+The Wolfi tag, `vX.Y.Z-wolfi`, is native amd64/arm64 only. Use the default tag when you
+need s390x or cross-compilation in any direction.
 
 ## Editions: CE / EE / EE-FIPS
 Build for the **edition of the Gateway you'll run the plugin in** - the `ee` tag gates
@@ -81,8 +112,11 @@ enterprise code, and FIPS swaps the crypto module, so a mismatched plugin can fa
 | `ee` | `tyk-gateway-ee` | amd64 / arm64 |
 | `ee-fips` | `tyk-gateway-fips` | amd64 / arm64 |
 ```bash
-docker run --rm -e EDITION=ee      -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so
-docker run --rm -e EDITION=ee-fips -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so
+docker run --rm -e EDITION=ee -v "$PWD:/plugin-source" \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
+
+docker run --rm -e EDITION=ee-fips -v "$PWD:/plugin-source" \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
 ```
 One image covers all three - the per-edition settings (tags, FIPS mechanism, **and the
 published architectures**) are resolved from the edition Gateways and baked per release. Arch
@@ -106,10 +140,14 @@ readelf --version-info my-plugin_vX.Y.Z_linux_amd64.so | grep GLIBC   # max symb
 Confirm it actually loads (the real ABI check) - two reusable scripts, any gateway image:
 ```bash
 # fast: load + symbol via the Gateway's own command (no redis/compose) - used by the gate
-./scripts/loadtest-gate.sh compile-tyk-plugin:vX.Y.Z tykio/tyk-gateway:vX.Y.Z [ce|ee|ee-fips]
+./scripts/loadtest-gate.sh \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z \
+  tykio/tyk-gateway:vX.Y.Z [ce|ee|ee-fips]
 
 # deep: full request path (Gateway + redis + httpbin), asserts the plugin runs
-./scripts/e2e-compose.sh   compile-tyk-plugin:vX.Y.Z tykio/tyk-gateway:vX.Y.Z [ce|ee|ee-fips]
+./scripts/e2e-compose.sh \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z \
+  tykio/tyk-gateway:vX.Y.Z [ce|ee|ee-fips]
 ```
 Or directly: `docker run --rm --entrypoint /opt/tyk-gateway/tyk -v "$PWD/plugin.so:/p.so:ro"
 tykio/tyk-gateway:vX.Y.Z plugin load -f /p.so -s MySymbol`.
@@ -120,18 +158,21 @@ and Gateway source are baked). Point it at a local mirror or a pre-seeded cache:
 ```bash
 # internal proxy (Athens/Artifactory/Nexus):
 docker run --rm -e GOPROXY=https://goproxy.internal -e GOSUMDB=off \
-  -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so
+  -v "$PWD:/plugin-source" chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
 # fully offline against a pre-populated module cache:
 docker run --rm --network none -e GOPROXY=file:///go/pkg/mod/cache/download -e GOSUMDB=off \
-  -v tyk-mod-cache:/go/pkg/mod -v "$PWD:/plugin-source" compile-tyk-plugin:vX.Y.Z my-plugin.so
+  -v tyk-mod-cache:/go/pkg/mod -v "$PWD:/plugin-source" \
+  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
 ```
 Full guide: **`docs/air-gapped.md`**.
 
-## Custom / self-built Gateway
-Plugins are ABI-bound to a *specific* Gateway build. If you run your own Gateway (fork,
-custom deps/tags, different Go), build a compiler from **your** source - the Dockerfiles
-and the build workflow are source-agnostic (`source_repo`/`source_ref`/`*_repo` inputs,
-or `GATEWAY_REPO=` for the resolver). Guide: **`docs/custom-gateway.md`**.
+## When to build your own compiler
+Do not build this repository for a stock `tykio/tyk-gateway:vX.Y.Z`. Use the matching
+prebuilt tag instead.
+
+Build your own compiler only when your Gateway is also custom: a fork, private patch,
+custom dependencies, custom build tags, or a different Go toolchain. See
+[`docs/custom-gateway.md`](docs/custom-gateway.md).
 
 ## macOS / Apple Silicon
 Multi-arch, so it runs **natively** on arm64 Macs - no `--platform=linux/amd64` or
@@ -139,51 +180,17 @@ emulation (unlike the legacy amd64-only image). Use `-e GOARCH=...` only to cros
 
 ---
 
-## How images are built & published (maintainers)
-Self-contained pipeline - input is just a Gateway version; everything else is derived
-from public artifacts. Publish to your own Docker Hub + GHCR namespaces.
+## Maintainer docs
+The README is intentionally focused on using the prebuilt images. Build and maintenance
+details live in the dedicated docs:
 
-```
-resolve (Gateway version -> Go ver, commit, EE/FIPS settings, Go checksums)
-  -> base    (Dockerfile.base: DHI + toolchains + glibc sysroots + scripts; slow cadence)
-  -> gate    (build candidate, load-test EVERY available edition into its matching
-              Gateway on amd64 AND arm64 - publish blocks unless all pass)
-  -> publish (Dockerfile.release: FROM base + exact Go + vendored Gateway source;
-              multi-arch -> GHCR + Docker Hub, SBOM + provenance)
-```
-- `.github/workflows/build.yml` - run it with a `gateway_version` (custom `*_repo` /
-  `source_*` inputs optional). Config: `DOCKERHUB_USER` (repo **variable** = username +
-  namespace) and `DOCKERHUB_TOKEN` (repo **secret** = Read & Write PAT, also pulls the
-  `dhi.io` base); GHCR uses the built-in `GITHUB_TOKEN`.
-- `.github/workflows/watch.yml` - daily; auto-builds **new proper releases** (no rc/alpha)
-  and re-stacks when the DHI base or an EE/FIPS gateway changes.
-- Local checks without the heavy build: `docker build -f Dockerfile.proof -t ctp:proof .`
-  then `./scripts/validate-proof.sh`; CVE comparison via `./scripts/cve-compare.sh`.
-
-Design and maintenance (why per-release is inherent to native Go plugins; the
-base/release split; what auto-adapts vs. needs a maintainer): **`docs/maintenance.md`**.
-
-### Tags
-| Tag | Meaning |
-|---|---|
-| `:vX.Y.Z` | default (DHI base), multi-arch (amd64+arm64); moving - always the latest patched build |
-| `:vX.Y.Z-YYYYMMDD` | immutable snapshot, for reproducible pinning (retained ~14 days; see `SUPPORT.md`) |
-| `:vX.Y.Z-wolfi` | Wolfi/Chainguard base variant (amd64+arm64 native only; see below) |
-| `:vX.Y.Z-glibc2.31` | opt-in higher glibc floor (2.31; default is 2.17/RHEL 7) - not RHEL 7 compatible |
-| `-base:latest` | the stable toolchain/sysroot base layer |
-
-**Which versions exist, and for how long**, is declared in [`releases.yml`](releases.yml) and
-documented in [`SUPPORT.md`](SUPPORT.md): the newest patches of the latest + LTS + LTS-1 lines are
-kept base-CVE-current; older/retired versions are frozen-but-available. Track the moving `:vX.Y.Z`
-for currency; pin `:vX.Y.Z-YYYYMMDD` or a digest for reproducibility.
-
-### Wolfi variant (for Chainguard shops)
-A second base is published from `build-wolfi.yml` as `:vX.Y.Z-wolfi` for teams
-standardised on Chainguard. Wolfi is glibc-based with no perl in the base, so it scans
-extremely cleanly; it ships no cross-compilers, so this variant builds **natively for
-amd64 and arm64 only** (no s390x, no cross). All editions (CE/EE/EE-FIPS) are supported
-for those two architectures. The default DHI image remains the full-coverage build
-(all target architectures, cross in any direction). See **`docs/base-images.md`**.
+- [`docs/maintenance.md`](docs/maintenance.md) - release/build pipeline, watch/prune,
+  base/release split.
+- [`docs/custom-gateway.md`](docs/custom-gateway.md) - building a compiler for a custom
+  Gateway.
+- [`docs/base-images.md`](docs/base-images.md) - DHI vs Wolfi base variants.
+- [`docs/compatibility.md`](docs/compatibility.md) - ABI and load-test evidence.
+- [`docs/security-note.md`](docs/security-note.md) - CVE comparison and scanner context.
 
 ## Why this exists
 Enterprise CVE scanners flag a lot of findings on general-purpose builder images. This
@@ -205,9 +212,6 @@ requires. Compatibility evidence and the CVE comparison: **`docs/compatibility.m
 - **`-race`**: not set by default (production Gateways don't use it); match it yourself
   if you target a `-race` Gateway. Mirrors the official compiler.
 - **C++ CGO** (`g++`) is included by default; `--build-arg WITH_CXX=0` drops it.
-- **The production image build is heavy** (vendors the Gateway + a large module
-  download). ABI correctness is proven by the CI gate, which loads a freshly built
-  plugin into the real Gateway before publishing (`docs/compatibility.md`).
 
 ## Repo layout
 ```
