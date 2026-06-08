@@ -217,6 +217,11 @@ requires. Compatibility evidence and the CVE comparison: **`docs/compatibility.m
 - **`-race`**: not set by default (production Gateways don't use it); match it yourself
   if you target a `-race` Gateway. Mirrors the official compiler.
 - **C++ CGO** (`g++`) is included by default; `--build-arg WITH_CXX=0` drops it.
+- **Default user is root**: current tags preserve drop-in compatibility with the
+  official compiler, so some scanners may report that no default non-root user is set.
+  This is known and acknowledged. If non-root-by-default tags matter for your
+  environment, raise or +1 a GitHub issue; the planned path is an opt-in variant, not a
+  behavior change to existing tags.
 
 ## Repo layout
 ```
