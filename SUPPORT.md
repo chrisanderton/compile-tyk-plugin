@@ -30,6 +30,21 @@ For each supported version `V` and variant (default = Docker Hardened Image; `-w
 **Guarantee:** because a compiler is fully reproducible from its Gateway version, **any supported
 version is always (re)buildable on request** - a bounded snapshot window costs you nothing.
 
+## FIPS (boringcrypto) plugins - validate the load
+
+The legacy **boringcrypto** FIPS lines (5.7/5.8; newer lines use Go-native FIPS-140-3) need the
+plugin's `crypto/internal/boring` to match the FIPS Gateway exactly. The compiler does this with a
+glibc header-compatibility shim baked into the image, and every published FIPS builder is verified
+to load into its matching FIPS Gateway. **But your plugin's own C/cgo surface can differ from the
+test plugin**, so if you build an `ee-fips` plugin from a boringcrypto release, **be especially
+vigilant: explicitly confirm your plugin loads into your target FIPS Gateway before production** -
+
+```
+tyk plugin load -f your-plugin.so -s YourSymbol
+```
+
+A successful **compile does not guarantee a successful load** for FIPS; that one command does.
+
 ## Currency
 
 Maintained/extra (ACTIVE) builders are rebuilt whenever the hardened base ships a CVE fix, so the

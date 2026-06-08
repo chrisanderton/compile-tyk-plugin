@@ -94,6 +94,26 @@ freshly built plugin actually loads into the real new Gateway for every edition 
 architecture, so an unforeseen incompatibility blocks the release instead of shipping
 broken.
 
+## boringcrypto FIPS: the glibc header overlay
+
+Legacy boringcrypto FIPS (`GOEXPERIMENT=boringcrypto` - the 5.7/5.8 lines; newer lines use native
+`GOFIPS140`) has a subtle ABI trap. glibc-2.17's `<stdint.h>` declares the fixed-width integer types
+**directly** (`typedef unsigned char uint8_t;`), whereas glibc >= 2.24 - and the toolchain Tyk builds
+the FIPS Gateway with - routes them through `__intN_t`/`__uintN_t`. cgo bakes that typedef *spelling*
+into `crypto/internal/boring`'s generated type, so a boringcrypto plugin compiled against the raw 2.17
+sysroot gets a different package build-ID than the Gateway and `plugin.Open` rejects it (`different
+version of package crypto/internal/boring`). It's invisible to CE/EE (they don't link real boring) and
+to native-`GOFIPS140` FIPS (its FIPS package isn't cgo) - so it only bites the boringcrypto FIPS pairing.
+
+The fix is scoped and floor-preserving. `Dockerfile.base` pre-builds a header-**only** overlay of
+`stdint.h` per 2.17 arch that re-aliases the fixed-width types the modern way (sourcing the real
+`__intN_t` from the sysroot's own `bits/types.h`); the base build **fails** if the rewrite did not apply,
+so it cannot silently regress. `build.sh` `-isystem`s that overlay **ahead of** the sysroot include
+**only** for `ee-fips` + boringcrypto. It is a pure type *alias* (no ABI/layout change) and the link
+still uses the real 2.17 sysroot, so the **glibc-2.17 floor is unchanged** and CE/EE / native-FIPS are
+untouched. The load-gate verifies it per edition/arch. A customer plugin with a wider cgo surface could
+in principle hit a *different* header difference - hence the "validate the load" note in `SUPPORT.md`.
+
 ## Which versions are maintained
 
 The supported set is **declared** in [`releases.yml`](../releases.yml), not inferred - so it is

@@ -297,6 +297,33 @@ case "$EDITION" in
 		[ -n "${TYK_FIPS_GOFIPS140:-}" ]    && export GOFIPS140="${TYK_FIPS_GOFIPS140}"
 		[ -n "${TYK_FIPS_GOEXPERIMENT:-}" ] && export GOEXPERIMENT="${GOEXPERIMENT:+${GOEXPERIMENT},}${TYK_FIPS_GOEXPERIMENT}"
 		[ -n "${TYK_FIPS_BUILD_TAG:-}" ]    && BUILD_TAG="${BUILD_TAG:+${BUILD_TAG},}${TYK_FIPS_BUILD_TAG}"
+		# boringcrypto FIPS ONLY: the glibc-2.17 sysroot's stdint.h declares the fixed-width ints
+		# DIRECTLY, but the FIPS Gateway's newer glibc routes them via __intN_t. cgo bakes that
+		# typedef into crypto/internal/boring's generated type, so a plugin built on the raw 2.17
+		# header gets a different package build-ID and the Gateway REJECTS it ("different version of
+		# package crypto/internal/boring"). Prepend the header-only overlay (built in Dockerfile.base)
+		# AHEAD of the sysroot include so boring's type identity matches the Gateway. -isystem ORDER
+		# matters (first match wins), hence inserting it right after the compiler. Pure type ALIAS;
+		# the LINK still uses the real 2.17 sysroot, so the glibc floor is UNCHANGED. CE/EE and
+		# native-GOFIPS140 FIPS never reach this branch. See docs/maintenance.md.
+		case ",${TYK_FIPS_GOEXPERIMENT:-}," in
+			*,boringcrypto,*)
+				OVL="${TYK_PLUGIN_OVERLAY_BASE:-/opt/tyk/sysroot-overlays}/boringcrypto/linux-${GOARCH}-glibc-${TYK_GLIBC_TARGET}/usr/include"
+				if [ -f "$OVL/stdint.h" ]; then
+					CC="${CC/"$GNU_CC"/$GNU_CC -isystem $OVL}"
+					echo "INFO: boringcrypto FIPS - prepended header overlay $OVL (matches Gateway glibc typedefs; glibc floor unchanged)"
+				elif [ "${TYK_GLIBC_TARGET}" = "2.17" ]; then
+					# FAIL FAST: without the overlay the plugin is GUARANTEED to be rejected by the FIPS
+					# Gateway ("different version of package crypto/internal/boring"). Erroring here beats
+					# emitting a known-bad .so, and it loudly flags a stale/misbuilt base missing the overlay.
+					echo "ERROR: boringcrypto FIPS on glibc-2.17 requires the stdint.h header overlay, but none was found at:" >&2
+					echo "         $OVL/stdint.h" >&2
+					echo "       The resulting plugin would NOT load into the FIPS Gateway. Rebuild the base image" >&2
+					echo "       (Dockerfile.base generates this overlay) - see docs/maintenance.md." >&2
+					exit 1
+				fi
+				;;
+		esac
 		echo "INFO: edition=ee-fips for ${GITHUB_TAG} - GOFIPS140='${GOFIPS140:-}' tags+='${TYK_FIPS_BUILD_TAG:-}'"
 		;;
 	*)

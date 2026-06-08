@@ -148,6 +148,32 @@ COPY data/build.sh           /build.sh
 COPY data/validate-plugin.sh /usr/local/bin/validate-plugin.sh
 RUN chmod +x /build.sh /usr/local/bin/validate-plugin.sh
 
+# --- boringcrypto-FIPS stdint.h overlay (glibc-2.17 only) -------------------
+# glibc-2.17's <stdint.h> declares the fixed-width ints DIRECTLY (e.g. `typedef unsigned char
+# uint8_t;`); glibc >=2.24 - and the Tyk FIPS Gateway - route them via __intN_t/__uintN_t. cgo
+# bakes that typedef spelling into crypto/internal/boring's generated type, so a boringcrypto
+# plugin built on the raw 2.17 header gets a DIFFERENT package build-ID than the Gateway and is
+# rejected by plugin.Open ("different version of package crypto/internal/boring"). We pre-build a
+# header-ONLY overlay that re-aliases the fixed-width types the modern way (sourcing the real
+# __intN_t from the sysroot's own bits/types.h). build.sh -isystem's it AHEAD of the sysroot
+# include for ee-fips+boringcrypto ONLY; CE/EE and native-GOFIPS140 FIPS never see it, and the
+# LINK still uses the real 2.17 sysroot - so the glibc floor is unchanged. Pure type ALIAS: no
+# ABI/layout/runtime effect. The build FAILS if the rewrite did not apply (no silent regression).
+# See docs/maintenance.md.
+RUN set -eux; \
+    if [ "${GLIBC_TARGET}" = "2.17" ]; then \
+      for SR in /opt/tyk/sysroots/linux-*-glibc-2.17; do \
+        [ -f "$SR/usr/include/stdint.h" ] || continue; \
+        rel="${SR#/opt/tyk/sysroots/}"; \
+        OV="/opt/tyk/sysroot-overlays/boringcrypto/${rel}/usr/include"; \
+        mkdir -p "$OV"; \
+        { echo '#include <bits/types.h>'; cat "$SR/usr/include/stdint.h"; } > "$OV/stdint.h"; \
+        sed -i -E 's/typedef[[:space:]]+[^;]*[[:space:]](u?int(8|16|32|64)_t)[[:space:]]*;/typedef __\1 \1;/' "$OV/stdint.h"; \
+        n="$(grep -cE 'typedef[[:space:]]+__(u?int(8|16|32|64)_t)[[:space:]]+(u?int(8|16|32|64)_t)[[:space:]]*;' "$OV/stdint.h")"; \
+        [ "$n" -ge 8 ] || { echo "ERROR: stdint overlay rewrite failed for $SR ($n routed typedefs)"; exit 1; }; \
+      done; \
+    fi
+
 # /usr/local/go/bin is on PATH ahead of time; Dockerfile.release drops Go there.
 ENV PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     GOTOOLCHAIN=local \
@@ -156,6 +182,7 @@ ENV PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr
     TYK_GW_PATH=/go/src/github.com/TykTechnologies/tyk \
     PLUGIN_SOURCE_PATH=/plugin-source \
     TYK_PLUGIN_SYSROOT_BASE=/opt/tyk/sysroots \
+    TYK_PLUGIN_OVERLAY_BASE=/opt/tyk/sysroot-overlays \
     TYK_GLIBC_TARGET=${GLIBC_TARGET}
 RUN mkdir -p $TYK_GW_PATH $PLUGIN_SOURCE_PATH /go/bin
 
