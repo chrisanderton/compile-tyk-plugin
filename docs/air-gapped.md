@@ -70,8 +70,8 @@ docker run --rm \
   compile-tyk-plugin:vX.Y.Z my-plugin.so          # offline
 ```
 With a warmed cache, this produces a valid plugin under `--network none`: correct Go
-version, the same dependency versions as the Gateway, and a glibc floor of 2.31. The
-build validator runs as usual and fails the build on any mismatch.
+version, the same dependency versions as the Gateway, and the default glibc-2.17 floor.
+The build validator runs as usual and fails the build on any mismatch.
 
 ### Notes
 - **Do NOT pass `GOFLAGS=-mod=mod`** - it's illegal in workspace mode (`-mod may only

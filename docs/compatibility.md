@@ -46,12 +46,11 @@ RHEL 7 upward, at no behavioral cost. Measured ceilings per target (2.17 sysroot
 | linux/arm64 | <= 2.17 |
 | linux/s390x | <= 2.17 |
 
-### Opting into a higher floor (2.31)
+### Opting into a higher floor
 
-If a plugin's C code calls a glibc function only added between 2.18 and 2.31, build the
-base with `GLIBC_TARGET=2.31` (Debian bullseye sysroot) - or pass `glibc_target: "2.31"`
-to the build workflow. Those plugins then require glibc >= 2.31 at the destination and
-will **not** load on RHEL 7. Stay on the 2.17 default unless you have that specific need.
+Higher floors are an advanced escape hatch for plugins whose own C/C++ code needs newer
+glibc APIs. They reduce portability and are not needed for normal Gateway images. See
+[`glibc-targets.md`](glibc-targets.md).
 
 ## Tested load matrix (v5.13.0)
 

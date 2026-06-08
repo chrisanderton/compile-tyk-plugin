@@ -25,7 +25,8 @@ For each supported version `V` and variant (default = Docker Hardened Image; `-w
   for actively-updated versions; frozen/retired versions keep only their latest snapshot. Pin these
   (or a digest) for a reproducible point-in-time build.
 - **Editions** are selected at build time (`-e EDITION=ce|ee|ee-fips`); **architectures** via `-e GOARCH`
-  (amd64/arm64/s390x). A higher glibc floor is on the opt-in `:V-glibc2.31` tags.
+  (amd64/arm64/s390x). Advanced glibc-floor variants are documented in
+  [`docs/glibc-targets.md`](docs/glibc-targets.md).
 
 **Guarantee:** because a compiler is fully reproducible from its Gateway version, **any supported
 version is always (re)buildable on request** - a bounded snapshot window costs you nothing.

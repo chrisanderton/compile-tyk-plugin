@@ -83,9 +83,9 @@ docker run --rm --entrypoint /opt/tyk-gateway/tyk -v "$PWD/plugin.so:/p.so:ro" \
 ```
 
 ## Caveats
-- The glibc **sysroot** target (2.31) must be <= your Gateway runtime's glibc - true for
-  any normal Linux base; if your runtime is unusually old, lower `GLIBC_TARGET` and
-  rebuild the base.
+- The default glibc **sysroot** target is 2.17 for RHEL 7 compatibility. If you
+  intentionally raise it, the target must be <= your Gateway runtime's glibc. See
+  [`glibc-targets.md`](glibc-targets.md).
 - A **different Go version** is fine - pass it; the base has no Go baked, the release
   layer installs whatever you specify.
 - **musl** custom runtime (e.g. Alpine-based fork) would need a musl sysroot/toolchain -

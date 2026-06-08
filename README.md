@@ -25,8 +25,8 @@ What it gives you:
 - **One image, many targets** - cross-compiles amd64/arm64/s390x and builds for the
   **CE / EE / EE-FIPS** editions, all selected with a flag.
 - **Old-glibc CGO compatibility as an isolated link sysroot** - plugins link against a
-  pinned glibc-2.17 floor (RHEL 7 / CentOS 7 ABI; `GLIBC_TARGET=2.31` to opt up) for
-  broad portability, while the image itself stays modern and small.
+  pinned glibc-2.17 floor (RHEL 7 / CentOS 7 ABI) for broad portability, while the image
+  itself stays modern and small.
 
 It is purpose-built for compiling plugins. The official `tyk-plugin-compiler` is a
 general-purpose Gateway release builder that does more than compile plugins, so a direct
@@ -48,9 +48,10 @@ Docker automatically pulls the native amd64 or arm64 image for your host.
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi` | Wolfi/Chainguard base. Native amd64/arm64 only; no s390x cross target. |
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-YYYYMMDD` | Immutable snapshot of the default tag for reproducible builds. |
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi-YYYYMMDD` | Immutable snapshot of the Wolfi tag. |
-| `chrisanderton/compile-tyk-plugin:vX.Y.Z-glibc2.31` | Opt-in higher glibc floor for plugins that need newer libc symbols. Not RHEL 7 compatible. |
 
 `vX.Y.Z` is your Tyk Gateway version, for example `v5.13.0`.
+
+Advanced glibc-floor variants are documented in [`docs/glibc-targets.md`](docs/glibc-targets.md).
 
 ```bash
 docker pull chrisanderton/compile-tyk-plugin:v5.13.0
@@ -82,7 +83,9 @@ Same interface as the official compiler - only the image name changes.
 - Preserved from the official compiler: `PLUGIN_SOURCE_PATH`, `PLUGIN_BUILD_PATH`,
   `BUILD_TAG`, `GO_GET`, `GO_TIDY`, `DEBUG`, `GOFIPS140`.
 - Added: `VALIDATE=0` to skip post-build validation; `GOPROXY`/`GOSUMDB` for air-gapped
-  builds (below); `TYK_GLIBC_TARGET`/`TYK_PLUGIN_SYSROOT_BASE` to retarget the sysroot.
+  builds (below).
+
+Advanced sysroot settings are documented in [`docs/glibc-targets.md`](docs/glibc-targets.md).
 
 Output naming matches the official convention: `{name}_{Gw-version}_{GOOS}_{GOARCH}.so`.
 
@@ -190,6 +193,8 @@ details live in the dedicated docs:
   Gateway.
 - [`docs/base-images.md`](docs/base-images.md) - DHI vs Wolfi base variants.
 - [`docs/compatibility.md`](docs/compatibility.md) - ABI and load-test evidence.
+- [`docs/glibc-targets.md`](docs/glibc-targets.md) - default glibc floor and rare
+  opt-in higher floors.
 - [`docs/security-note.md`](docs/security-note.md) - CVE comparison and scanner context.
 
 ## Why this exists
@@ -224,6 +229,6 @@ scripts/                 resolve-gateway.sh, loadtest-gate.sh, e2e-compose.sh, v
 loadtest/                test-plugin + docker-compose for E2E
 proof/                   tiny CGO plugin for the proof-image toolchain validation
 .github/workflows/       build.yml + build-wolfi.yml (DHI + Wolfi pipelines), watch.yml (auto-trigger)
-docs/                    base-images.md, compatibility.md, fips.md, air-gapped.md,
-                         custom-gateway.md, maintenance.md, security-note.md
+docs/                    base-images.md, compatibility.md, glibc-targets.md, fips.md,
+                         air-gapped.md, custom-gateway.md, maintenance.md, security-note.md
 ```

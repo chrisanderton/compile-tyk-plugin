@@ -61,14 +61,14 @@ The new image's CRITICALs were **100% perl** - two CVEs with **no upstream fix**
    keeps only what `build.sh` uses (bash, jq, gcc, binutils, file, make, Go; git is
    optional via `WITH_GIT`).
 
-## Old glibc as a sysroot, not the OS - the central architectural point
+## glibc compatibility as a sysroot, not the OS - the central architectural point
 
 CGO plugins need **glibc symbol compatibility** with the Gateway runtime. This image
 provides that without running an old OS:
 
-- The old glibc (2.31) exists **only as files under `/opt/tyk/sysroots/`** - `libc`,
-  the dynamic loader, `crt*.o`, headers, and linker scripts. It is consumed by the
-  linker at build time and **never installed as OS packages, never on `PATH`, and
+- The glibc compatibility sysroot exists **only as files under `/opt/tyk/sysroots/`** -
+  `libc`, the dynamic loader, `crt*.o`, headers, and linker scripts. It is consumed by
+  the linker at build time and **never installed as OS packages, never on `PATH`, and
   never executed as the container's runtime libc.**
 - So it does **not** appear in the image's OS package inventory, and it does not bring
   along an older base's wider userspace of packages.
@@ -77,6 +77,7 @@ provides that without running an old OS:
 
 That is the distinction between linking against an old libc (a contained, file-level
 build input) and running an old distro as the OS (a broader, system-wide surface).
+The default target is documented in [`glibc-targets.md`](glibc-targets.md).
 
 ## What remains in the new image (and why)
 
