@@ -67,8 +67,23 @@ case "$GOOS/$GOARCH" in
   linux/s390x) GNU_CC=s390x-linux-gnu-gcc;   DYNLD=/lib/ld64.so.1 ;;
   *)           GNU_CC=$(go env CC);          DYNLD="" ;;
 esac
-# Fall back to a plain native gcc if the triplet-prefixed cross gcc is absent.
-command -v "$GNU_CC" >/dev/null 2>&1 || GNU_CC=$(go env CC)
+# Resolve the C compiler. If the per-arch cross gcc is absent there are two cases:
+#   * TARGET == host arch  -> the triplet gcc just isn't triplet-named here; the plain native
+#                             gcc IS the right compiler (this is the normal Wolfi native build).
+#   * TARGET != host arch  -> this image cannot cross-compile. The Wolfi variant ships NO cross
+#                             toolchains, so falling back to the native gcc would silently build
+#                             wrong-arch objects and fail later with a baffling cgo/link error.
+#                             Fail fast with an actionable message instead.
+if ! command -v "$GNU_CC" >/dev/null 2>&1; then
+  if [ "$GOOS" = "linux" ] && [ "$GOARCH" != "$HOST_ARCH" ]; then
+    echo "ERROR: cannot build for linux/$GOARCH - this image has no cross toolchain ('$GNU_CC' is not installed)." >&2
+    echo "       This is a NATIVE-ONLY image (e.g. the Wolfi variant): it builds for its host arch ($HOST_ARCH) only." >&2
+    echo "       Fix: build for $HOST_ARCH (drop '-e GOARCH', or set GOARCH=$HOST_ARCH)," >&2
+    echo "            OR use the default (DHI) image, which cross-compiles to amd64/arm64/s390x." >&2
+    exit 1
+  fi
+  GNU_CC=$(go env CC)   # native target, no triplet-named gcc -> the plain native gcc is correct
+fi
 
 CC="$GNU_CC"
 EXTLDFLAGS=""
