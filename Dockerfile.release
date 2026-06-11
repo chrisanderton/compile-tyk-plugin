@@ -30,7 +30,8 @@ RUN set -eux; \
       arm64) sha="${GO_SHA256_arm64}";; \
       *) echo "compiler image only builds for amd64/arm64 hosts (got ${TARGETARCH})" >&2; exit 1;; \
     esac; \
-    curl -fsSL "https://go.dev/dl/go${v}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 30 \
+      "https://go.dev/dl/go${v}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz; \
     echo "${sha}  /tmp/go.tgz" | sha256sum -c -; \
     mkdir -p /usr/local; tar -C /usr/local -xzf /tmp/go.tgz; rm /tmp/go.tgz; \
     /usr/local/go/bin/go version
