@@ -55,8 +55,16 @@ fetch_gw_binary() {
   return 1
 }
 
-# 1. Gateway commit - from the image's standard revision label.
-CFG="$(crane config "$GW" 2>&1)" || { echo "ERROR: crane config $GW failed:" >&2; echo "$CFG" | head -3 >&2; exit 1; }
+# 1. Gateway commit - from the image's standard revision label. Retry a few times:
+# registry i/o timeouts here are transient (the gateway tag must exist for this build to run),
+# so a one-off Docker Hub hiccup shouldn't fail the whole resolve.
+CFG=""; ok=false
+for attempt in 1 2 3; do
+  if CFG="$(crane config "$GW" 2>&1)"; then ok=true; break; fi
+  echo "crane config $GW failed (attempt $attempt/3)" >&2
+  [ "$attempt" -lt 3 ] && sleep $((attempt*3))
+done
+$ok || { echo "ERROR: crane config $GW failed:" >&2; echo "$CFG" | head -3 >&2; exit 1; }
 SHA="$(echo "$CFG" | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')"
 [ -n "$SHA" ] || { echo "ERROR: no org.opencontainers.image.revision label on $GW" >&2; exit 1; }
 
@@ -94,7 +102,7 @@ if [ "$GATEWAY_TRIMPATH" = "false" ]; then
 fi
 
 # 3. Official Go tarball checksums for that exact version (no hardcoding).
-GODL="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all')" || { echo "ERROR: fetching go.dev release index failed" >&2; exit 1; }
+GODL="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 30 'https://go.dev/dl/?mode=json&include=all')" || { echo "ERROR: fetching go.dev release index failed" >&2; exit 1; }
 sha_for() { echo "$GODL" | jq -r --arg v "$GO_VERSION" --arg a "$1" \
   '.[]|select(.version==$v).files[]|select(.os=="linux" and .arch==$a and .kind=="archive").sha256'; }
 GO_SHA256_amd64="$(sha_for amd64)"
