@@ -45,7 +45,19 @@ ok "architecture: $machine"
 
 # --- 2. go version -m: toolchain + dependency alignment ---------------------
 if command -v go >/dev/null; then
-  buildinfo="$(go version -m "$SO" 2>/dev/null)"
+  # `go version -m` is built for executables and intermittently returns NOTHING for a
+  # -buildmode=plugin .so (more often under load). Retry, and track whether it was actually
+  # readable - so a transient empty read is NOT mistaken for a missing build tag / missing FIPS
+  # marker (that mistake caused spurious, load-correlated validation failures). FIPS detection
+  # below reads the BINARY itself (load-independent), not this metadata.
+  buildinfo=""
+  for _try in 1 2 3; do
+    buildinfo="$(go version -m "$SO" 2>/dev/null || true)"
+    [ -n "$buildinfo" ] && break
+    sleep 1
+  done
+  bi_readable=false; [ -n "$buildinfo" ] && bi_readable=true
+  [ "$bi_readable" = true ] || echo "  ! note: go version -m returned no build info for this plugin .so (retried) - tag/dependency checks below defer to the gateway load test."
   plugin_go="$(echo "$buildinfo" | head -1 | awk '{print $2}')"
   # Only accept a real toolchain string (goX.Y[.Z]). Older Go does not expose the
   # toolchain for a -buildmode=plugin .so via `go version -m`, leaving this blank.
@@ -74,16 +86,48 @@ if command -v go >/dev/null; then
   edition="$(echo "${EXPECT_EDITION:-ce}" | tr 'A-Z' 'a-z')"
   if [ "$edition" = "ee" ] || [ "$edition" = "ee-fips" ]; then
     tagsval="$(echo "$buildinfo" | grep -oE '\-tags=[^[:space:]]+' | head -1 | sed 's/-tags=//')"
-    case ",$tagsval," in
-      *,ee,*) ok "edition: 'ee' build tag present" ;;
-      *) fail "EDITION=$edition but the plugin lacks the 'ee' build tag (tags: ${tagsval:-none}) - it will not match an EE/FIPS Gateway." ;;
-    esac
+    if [ -n "$tagsval" ]; then
+      case ",$tagsval," in
+        *,ee,*) ok "edition: 'ee' build tag present" ;;
+        *) fail "EDITION=$edition but the plugin's -tags=$tagsval lacks 'ee' - it will not match an EE/FIPS Gateway." ;;
+      esac
+    elif [ "$bi_readable" = true ]; then
+      echo "  ! note: EDITION=$edition - no -tags line in build info; deferring the 'ee' check to the gateway load test (definitive)."
+    else
+      # Do NOT fail on a missing marker we could not read: that turns a transient unreadable
+      # build info into a spurious failure. The gateway load test (plugin.Open) is definitive.
+      echo "  ! note: EDITION=$edition - build info unreadable; the gateway load test is the definitive 'ee' check."
+    fi
   fi
   if [ "$edition" = "ee-fips" ]; then
-    fipsmark="$(echo "$buildinfo" | grep -oE 'GOFIPS140=[^[:space:]]+' | head -1)"
-    if [ -n "$fipsmark" ]; then ok "FIPS: $fipsmark"
-    elif echo "$buildinfo" | grep -qi 'boringcrypto'; then ok "FIPS: boringcrypto"
-    else fail "EDITION=ee-fips but the plugin has no FIPS crypto (no GOFIPS140 / boringcrypto) - it will not match a FIPS Gateway."
+    # Authoritative FIPS check reads the BINARY (deterministic, load-independent) - NOT the
+    # build-info metadata, which `go version -m` intermittently fails to surface for a
+    # -buildmode=plugin .so (notably under load), which previously caused spurious
+    # "no FIPS crypto" failures. boringcrypto links BoringSSL (_goboringcrypto* /
+    # crypto/internal/boring symbols); Go-native FIPS-140 compiles in crypto/internal/fips140.
+    # build info is only a fallback if symbol scanning is somehow unavailable.
+    # IMPORTANT: extract the marker LINES with `grep -o` (reads all input) rather than
+    # `grep -q` (closes the pipe early -> SIGPIPEs the huge strings/nm output -> the pipeline
+    # reports failure under `set -o pipefail`, which would silently drop back to build info).
+    marks=""
+    if command -v strings >/dev/null 2>&1; then
+      marks="$(strings -a "$SO" 2>/dev/null | grep -oiE '_goboringcrypto|crypto/internal/(boring|fips140)' | sort -u || true)"
+    fi
+    if [ -z "$marks" ] && command -v nm >/dev/null 2>&1; then
+      marks="$(nm "$SO" 2>/dev/null | grep -oiE 'boringcrypto|crypto/internal/(boring|fips140)' | sort -u || true)"
+    fi
+    fipskind=""
+    if printf '%s\n' "$marks" | grep -qiE '_?goboringcrypto|crypto/internal/boring'; then
+      fipskind="boringcrypto (binary symbols)"
+    elif printf '%s\n' "$marks" | grep -qi 'crypto/internal/fips140'; then
+      fipskind="GOFIPS140 (binary symbols)"
+    elif echo "$buildinfo" | grep -qE 'GOFIPS140='; then
+      fipskind="$(echo "$buildinfo" | grep -oE 'GOFIPS140=[^[:space:]]+' | head -1) (build-info)"
+    elif echo "$buildinfo" | grep -qi 'boringcrypto'; then
+      fipskind="boringcrypto (build-info)"
+    fi
+    if [ -n "$fipskind" ]; then ok "FIPS: $fipskind"
+    else fail "EDITION=ee-fips but the plugin shows NO FIPS crypto - no boringcrypto/fips140 symbols in the binary AND no GOFIPS140/boringcrypto in build info. It will not match a FIPS Gateway."
     fi
   fi
   # tyk dependency revision alignment (best-effort; pseudo-version embeds the sha)

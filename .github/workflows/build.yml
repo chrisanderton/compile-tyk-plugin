@@ -22,6 +22,12 @@ on:
         description: "Gateway version, e.g. v5.13.0"
         required: true
         type: string
+      variant:
+        description: "Image variant: dhi (default, full) or slim (low-CVE - Debian cruft purged, FROM -base-slim)"
+        required: false
+        type: choice
+        options: [dhi, slim]
+        default: dhi
       push:
         description: "Push to registries"
         required: false
@@ -62,6 +68,10 @@ on:
       gateway_version:
         required: true
         type: string
+      variant:
+        required: false
+        type: string
+        default: dhi
       push:
         required: false
         type: boolean
@@ -118,6 +128,9 @@ jobs:
       date:       ${{ steps.meta.outputs.date }}
       dh_ns:      ${{ steps.meta.outputs.dh_ns }}
       glibc_suffix: ${{ steps.meta.outputs.glibc_suffix }}
+      base_pkg_sfx: ${{ steps.meta.outputs.base_pkg_sfx }}
+      var_sfx:      ${{ steps.meta.outputs.var_sfx }}
+      var_desc:     ${{ steps.meta.outputs.var_desc }}
       ee_available:      ${{ steps.r.outputs.EE_AVAILABLE }}
       ee_build_tag:      ${{ steps.r.outputs.EE_BUILD_TAG }}
       fips_available:    ${{ steps.r.outputs.FIPS_AVAILABLE }}
@@ -173,16 +186,24 @@ jobs:
           # never overwrites the canonical 2.17 default images (empty suffix => 2.17, untouched).
           g="${{ inputs.glibc_target }}"; g="${g:-2.17}"
           if [ "$g" = "2.17" ]; then echo "glibc_suffix=" >> "$GITHUB_OUTPUT"; else echo "glibc_suffix=-glibc$g" >> "$GITHUB_OUTPUT"; fi
+          # variant: dhi -> FROM '-base', unsuffixed tags; slim -> FROM '-base-slim', '-slim' tags.
+          case "${{ inputs.variant }}" in
+            slim) echo "base_pkg_sfx=-base-slim" >> "$GITHUB_OUTPUT"; echo "var_sfx=-slim" >> "$GITHUB_OUTPUT"
+                  echo "var_desc=slimmed DHI base (same hardened base + cross toolchains, unused packages purged for a lower CVE count), glibc-2.17 sysroot" >> "$GITHUB_OUTPUT" ;;
+            *)    echo "base_pkg_sfx=-base"      >> "$GITHUB_OUTPUT"; echo "var_sfx="      >> "$GITHUB_OUTPUT"
+                  echo "var_desc=DHI base, glibc-2.17 sysroot default" >> "$GITHUB_OUTPUT" ;;
+          esac
       # Pin the base built by build-base.yml. The compiler FROMs this exact digest and
       # inherits its io.ctp.dhi-base-digest label, so the gate + the watcher's level-trigger
       # are unchanged. Fails fast with guidance if the base has not been built yet.
       - id: basepin
         env:
           SFX: ${{ steps.meta.outputs.glibc_suffix }}
+          BPS: ${{ steps.meta.outputs.base_pkg_sfx }}
         run: |
-          base="ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base:latest${SFX}"
-          d="$(crane digest "$base")" || { echo "::error::base image $base not found - run build-base.yml (variant dhi${SFX:+, glibc_target ${SFX#-glibc}}) first."; exit 1; }
-          echo "ref=ghcr.io/${GHCR_NS}/${IMAGE_NAME}-base@${d}" >> "$GITHUB_OUTPUT"
+          base="ghcr.io/${GHCR_NS}/${IMAGE_NAME}${BPS}:latest${SFX}"
+          d="$(crane digest "$base")" || { echo "::error::base image $base not found - run build-base.yml (variant ${{ inputs.variant }}${SFX:+, glibc_target ${SFX#-glibc}}) first."; exit 1; }
+          echo "ref=ghcr.io/${GHCR_NS}/${IMAGE_NAME}${BPS}@${d}" >> "$GITHUB_OUTPUT"
       # Build the gate matrix from the per-edition published architectures - DATA-DRIVEN:
       # each {edition,arch} that a Gateway actually ships gets gated (s390x via qemu).
       - id: gm
@@ -271,8 +292,8 @@ jobs:
             CE_ARCHS=${{ needs.resolve.outputs.ce_archs }}
             EE_ARCHS=${{ needs.resolve.outputs.ee_archs }}
             FIPS_ARCHS=${{ needs.resolve.outputs.fips_archs }}
-          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}${{ needs.resolve.outputs.glibc_suffix }}
-          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}${{ needs.resolve.outputs.glibc_suffix }},mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}${{ needs.resolve.outputs.var_sfx }}${{ needs.resolve.outputs.glibc_suffix }}
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}${{ needs.resolve.outputs.var_sfx }}${{ needs.resolve.outputs.glibc_suffix }},mode=max
       - name: Export per-arch digest
         run: |
           mkdir -p /tmp/digest
@@ -356,6 +377,8 @@ jobs:
           TAG: ${{ needs.resolve.outputs.github_tag }}
           DATE: ${{ needs.resolve.outputs.date }}
           SFX: ${{ needs.resolve.outputs.glibc_suffix }}
+          VSFX: ${{ needs.resolve.outputs.var_sfx }}
+          VDESC: ${{ needs.resolve.outputs.var_desc }}
         run: |
           AMD="$(cat /tmp/digest/amd64)"
           ARM="$(cat /tmp/digest/arm64)"
@@ -366,9 +389,9 @@ jobs:
           # propagate to the index). Source links the package to the repo.
           docker buildx imagetools create \
             --annotation "index:org.opencontainers.image.title=compile-tyk-plugin" \
-            --annotation "index:org.opencontainers.image.description=Community/unofficial modern low-CVE compiler for Tyk Go plugins (DHI base, glibc-2.17 sysroot default). Not affiliated with Tyk." \
+            --annotation "index:org.opencontainers.image.description=Community/unofficial modern low-CVE compiler for Tyk Go plugins (${VDESC}). Not affiliated with Tyk." \
             --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             --annotation "index:org.opencontainers.image.licenses=MPL-2.0" \
-            -t "${GHCR_IMG}:${TAG}${SFX}" -t "${GHCR_IMG}:${TAG}${SFX}-${DATE}" \
-            -t "${DH_IMG}:${TAG}${SFX}"   -t "${DH_IMG}:${TAG}${SFX}-${DATE}" \
+            -t "${GHCR_IMG}:${TAG}${VSFX}${SFX}" -t "${GHCR_IMG}:${TAG}${VSFX}${SFX}-${DATE}" \
+            -t "${DH_IMG}:${TAG}${VSFX}${SFX}"   -t "${DH_IMG}:${TAG}${VSFX}${SFX}-${DATE}" \
             "${GHCR_IMG}@${AMD}" "${GHCR_IMG}@${ARM}"

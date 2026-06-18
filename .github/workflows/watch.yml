@@ -58,8 +58,9 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      base_variant:   ${{ steps.d.outputs.base_variant }}    # dhi | wolfi | both | none
+      base_variant:   ${{ steps.d.outputs.base_variant }}    # space-separated subset of {dhi,slim,wolfi}, or none
       dhi_versions:   ${{ steps.d.outputs.dhi_versions }}    # space list, capped, oldest-first
+      slim_versions:  ${{ steps.d.outputs.slim_versions }}
       wolfi_versions: ${{ steps.d.outputs.wolfi_versions }}
       main_missing:   ${{ steps.d.outputs.main_missing }}    # true | false (lone-first guard)
     steps:
@@ -122,47 +123,57 @@ jobs:
             | jq -r '[.manifests[]?|select((.platform.os//"")=="linux" and (.platform.architecture//"")!="unknown")|.platform.architecture]|sort|unique|join(",")' 2>/dev/null || true; }
 
           # (A) Is the BASE LAYER itself stale? (missing, or built on an older upstream digest)
+          # slim = the DHI base + purge, so it records the DHI upstream digest too and goes stale
+          # exactly when DHI does (tracked separately so a lagged slim base build still catches up).
           dhi_base_have="$(base_of "${img}-base:latest")"
+          slim_base_have="$(base_of "${img}-base-slim:latest")"
           wolfi_base_have="$(base_of "${img}-base-wolfi:latest")"
-          dhi_base_stale=false; wolfi_base_stale=false
+          dhi_base_stale=false; slim_base_stale=false; wolfi_base_stale=false
           if [ "$FORCE_ALL" = "true" ] || [ "$dhi_base_have"   != "$dhi_now"   ]; then dhi_base_stale=true;   fi
+          if [ "$FORCE_ALL" = "true" ] || [ "$slim_base_have"  != "$dhi_now"   ]; then slim_base_stale=true;  fi
           if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_base_have" != "$wolfi_now" ]; then wolfi_base_stale=true; fi
-          if   [ "$dhi_base_stale" = true ] && [ "$wolfi_base_stale" = true ]; then bv=both
-          elif [ "$dhi_base_stale" = true ]; then bv=dhi
-          elif [ "$wolfi_base_stale" = true ]; then bv=wolfi
-          else bv=none; fi
+          bv=""
+          [ "$dhi_base_stale"   = true ] && bv="$bv dhi"
+          [ "$slim_base_stale"  = true ] && bv="$bv slim"
+          [ "$wolfi_base_stale" = true ] && bv="$bv wolfi"
+          bv="$(echo $bv | xargs || true)"; [ -n "$bv" ] || bv=none
           echo "base_variant=$bv" >> "$GITHUB_OUTPUT"
-          echo "base: DHI stale=$dhi_base_stale (on ${dhi_base_have:-<missing>}); WOLFI stale=$wolfi_base_stale (on ${wolfi_base_have:-<missing>}) -> rebuild=$bv"
+          echo "base: DHI stale=$dhi_base_stale (on ${dhi_base_have:-<missing>}); SLIM stale=$slim_base_stale (on ${slim_base_have:-<missing>}); WOLFI stale=$wolfi_base_stale (on ${wolfi_base_have:-<missing>}) -> rebuild='$bv'"
 
           # (B) Which VERSIONS need a (re)build - LEVEL-triggered per version (compare each image's
           #     recorded base to live). Converges even when capped/failed: laggards catch up next run.
-          need_dhi=""; need_wolfi=""
+          need_dhi=""; need_slim=""; need_wolfi=""
           for v in $active; do
             cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
             dhi_have="$(echo "$cfg" | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty')"
             if [ "$FORCE_ALL" = "true" ] || [ "$dhi_have" != "$dhi_now" ]; then need_dhi="$need_dhi $v"; fi
+            slim_have="$(base_of "${img}:${v}-slim")"   # slim re-stacks on the same DHI digest as dhi
+            if [ "$FORCE_ALL" = "true" ] || [ "$slim_have" != "$dhi_now" ]; then need_slim="$need_slim $v"; fi
             wolfi_have="$(base_of "${img}:${v}-wolfi")"
             if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then need_wolfi="$need_wolfi $v"; fi
-            # edition/arch coverage drift (read from the existing DHI image) -> rebuild both variants
+            # edition/arch coverage drift (read from the existing DHI image) -> rebuild all variants
             [ "$cfg" = '{}' ] && continue
             for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
               ed="${spec%%:*}"; gw="${spec##*:}"
               live="$(live_archs "${gw}:${v}")"; have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
-              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; need_dhi="$need_dhi $v"; need_wolfi="$need_wolfi $v"; fi
+              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; need_dhi="$need_dhi $v"; need_slim="$need_slim $v"; need_wolfi="$need_wolfi $v"; fi
             done
           done
           # FROZEN: build once if the image is missing; never re-stacked on a base change.
           for v in $frozen; do
             crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image (frozen)";   need_dhi="$need_dhi $v"; }
+            crane manifest "${img}:${v}-slim"  >/dev/null 2>&1 || { echo "-> $v: no slim image (frozen)";  need_slim="$need_slim $v"; }
             crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)"; need_wolfi="$need_wolfi $v"; }
           done
 
           # dedupe + OLDEST FIRST (sort -V) + cap (MAX_DISPATCH spreads a big backfill over days).
           dhi_uniq="$(echo $need_dhi     | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
+          slim_uniq="$(echo $need_slim   | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
           wolfi_uniq="$(echo $need_wolfi | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
           echo "dhi_versions=$(echo $dhi_uniq)"     >> "$GITHUB_OUTPUT"
+          echo "slim_versions=$(echo $slim_uniq)"   >> "$GITHUB_OUTPUT"
           echo "wolfi_versions=$(echo $wolfi_uniq)" >> "$GITHUB_OUTPUT"
-          echo "to build: DHI=[$(echo $dhi_uniq)] WOLFI=[$(echo $wolfi_uniq)]"
+          echo "to build: DHI=[$(echo $dhi_uniq)] SLIM=[$(echo $slim_uniq)] WOLFI=[$(echo $wolfi_uniq)]"
 
           # (C) Does the main package exist yet? If not, fan-out must seed ONE build first so the
           #     package is created+linked serially (else N concurrent first-pushes race on creation).
@@ -198,28 +209,31 @@ jobs:
           BASE_VARIANT: ${{ needs.plan.outputs.base_variant }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
           DHI_V: ${{ needs.plan.outputs.dhi_versions }}
+          SLIM_V: ${{ needs.plan.outputs.slim_versions }}
           WOLFI_V: ${{ needs.plan.outputs.wolfi_versions }}
         run: |
           set -euo pipefail
-          dhi="${DHI_V}"; wolfi="${WOLFI_V}"
+          dhi="${DHI_V}"; slim="${SLIM_V}"; wolfi="${WOLFI_V}"
           if [ "$DRY_RUN" = "true" ]; then
             echo "DRY RUN - nothing built or dispatched."
             echo "  stale base to rebuild : ${BASE_VARIANT}"
             echo "  main package missing  : ${MAIN_MISSING}"
             echo "  would dispatch DHI    : ${dhi:-<none>}"
+            echo "  would dispatch Slim   : ${slim:-<none>}"
             echo "  would dispatch Wolfi  : ${wolfi:-<none>}"
             exit 0
           fi
-          if [ -z "${dhi}${wolfi}" ]; then echo "nothing to build"; exit 0; fi
+          if [ -z "${dhi}${slim}${wolfi}" ]; then echo "nothing to build"; exit 0; fi
           if [ "$MAIN_MISSING" = "true" ]; then
-            first="$(printf '%s\n%s\n' $dhi $wolfi | grep -E '^v' | sort -uV | head -n1 || true)"
+            first="$(printf '%s\n%s\n%s\n' $dhi $slim $wolfi | grep -E '^v' | sort -uV | head -n1 || true)"
             echo "FIRST SEED: compile-tyk-plugin package absent - dispatching ONE build (${first:-none}) to create+link it serially; the rest fan out next run (no creation race)."
             if [ -n "$first" ]; then gh workflow run build.yml -f gateway_version="$first" -f push=true || echo "WARN: dispatch failed $first"; fi
             exit 0
           fi
           ok=0; fail=0
-          for v in $dhi;   do echo "dispatch DHI $v";   if gh workflow run build.yml       -f gateway_version="$v" -f push=true; then ok=$((ok+1)); else echo "WARN: dhi dispatch failed $v";   fail=$((fail+1)); fi; done
-          for v in $wolfi; do echo "dispatch Wolfi $v"; if gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true; then ok=$((ok+1)); else echo "WARN: wolfi dispatch failed $v"; fail=$((fail+1)); fi; done
+          for v in $dhi;   do echo "dispatch DHI $v";   if gh workflow run build.yml       -f gateway_version="$v" -f push=true;                   then ok=$((ok+1)); else echo "WARN: dhi dispatch failed $v";   fail=$((fail+1)); fi; done
+          for v in $slim;  do echo "dispatch Slim $v";  if gh workflow run build.yml       -f gateway_version="$v" -f variant=slim -f push=true;   then ok=$((ok+1)); else echo "WARN: slim dispatch failed $v";  fail=$((fail+1)); fi; done
+          for v in $wolfi; do echo "dispatch Wolfi $v"; if gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true;                   then ok=$((ok+1)); else echo "WARN: wolfi dispatch failed $v"; fail=$((fail+1)); fi; done
           echo "dispatched ok=$ok failed=$fail"
           # per-item resilience (one bad dispatch never blocks the rest), but a TOTAL failure
           # (e.g. wrong repo/permissions) must fail loudly, not look like a successful no-op.

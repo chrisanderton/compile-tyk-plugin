@@ -20,10 +20,10 @@ ARG GO_VERSION
 ARG TARGETARCH
 ARG GO_SHA256_amd64=42d4f7a32316aa66591eca7e89867256057a4264451aca10570a715b3637ba70
 ARG GO_SHA256_arm64=654da1f9b50a5d1c2a85ccf8ed405aa89c06e94d18384628bf186f7712677b08
-RUN set -eux; apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*; \
+# Go via BuildKit ADD + sha verify (no curl). GO_VERSION here is the bare number (e.g. 1.25.10).
+ADD https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz /tmp/go.tgz
+RUN set -eux; \
     case "${TARGETARCH}" in amd64) sha="${GO_SHA256_amd64}";; arm64) sha="${GO_SHA256_arm64}";; *) exit 1;; esac; \
-    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 30 \
-      "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz; \
     echo "${sha}  /tmp/go.tgz" | sha256sum -c -; \
     mkdir -p /usr/local; tar -C /usr/local -xzf /tmp/go.tgz; rm /tmp/go.tgz
 

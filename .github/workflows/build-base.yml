@@ -5,13 +5,15 @@ name: build-base
 # build-wolfi.yml) then just `FROM` the published `-base:latest`, so the slow base work is
 # never repeated per version. Publishes:
 #   compile-tyk-plugin-base:latest        (DHI variant)
+#   compile-tyk-plugin-base-slim:latest   (DHI base + SLIM purge - same toolchains, lower CVE)
 #   compile-tyk-plugin-base-wolfi:latest  (Wolfi variant)
-# plus their :buildcache. The two variants run as separate matrix legs writing to separate
+# plus their :buildcache. The variants run as separate matrix legs writing to separate
 # packages, so first-creation is serial per package (no concurrent-creation permission race).
 #
 # Trigger it directly to refresh a base on a CVE bump, or let watch.yml call it (workflow_call)
-# before fanning out release re-stacks. The DHI and Wolfi bases move independently - rebuild
-# only the one whose upstream digest changed via the `variant` input.
+# before fanning out release re-stacks. The DHI/slim and Wolfi bases move independently - rebuild
+# only the one(s) whose upstream digest changed via the `variant` input (slim shares DHI's
+# upstream, so it re-bases whenever DHI does).
 #
 # Config: DOCKERHUB_USER (repo variable = username + namespace), DOCKERHUB_TOKEN (repo secret =
 # Read & Write PAT; also pulls the dhi.io base). GHCR uses the built-in GITHUB_TOKEN.
@@ -23,8 +25,8 @@ on:
         description: "Which base(s) to build"
         required: false
         type: choice
-        options: [both, dhi, wolfi]
-        default: both
+        options: [all, dhi, wolfi, slim]
+        default: all
       glibc_target:
         description: "Plugin glibc floor baked into the sysroot: 2.17 (RHEL 7+, default) or 2.31"
         required: false
@@ -35,7 +37,7 @@ on:
       variant:
         required: false
         type: string
-        default: both
+        default: all
       glibc_target:
         required: false
         type: string
@@ -78,13 +80,26 @@ jobs:
           set -euo pipefail
           g="${GLIBC:-2.17}"
           if [ "$g" = "2.17" ]; then echo "glibc_suffix=" >> "$GITHUB_OUTPUT"; else echo "glibc_suffix=-glibc$g" >> "$GITHUB_OUTPUT"; fi
-          dhi='{"variant":"dhi","base":"'"${DHI_BASE}"'","suffix":"-base","title":"compile-tyk-plugin-base","flavour":"DHI"}'
-          wolfi='{"variant":"wolfi","base":"'"${WOLFI_BASE}"'","suffix":"-base-wolfi","title":"compile-tyk-plugin-base-wolfi","flavour":"Wolfi"}'
-          case "${VARIANT:-both}" in
-            dhi)   printf 'matrix=[%s]\n'    "$dhi"          >> "$GITHUB_OUTPUT" ;;
-            wolfi) printf 'matrix=[%s]\n'    "$wolfi"        >> "$GITHUB_OUTPUT" ;;
-            *)     printf 'matrix=[%s,%s]\n' "$dhi" "$wolfi" >> "$GITHUB_OUTPUT" ;;
-          esac
+          dhi='{"variant":"dhi","base":"'"${DHI_BASE}"'","suffix":"-base","title":"compile-tyk-plugin-base","flavour":"DHI","slim":"0"}'
+          wolfi='{"variant":"wolfi","base":"'"${WOLFI_BASE}"'","suffix":"-base-wolfi","title":"compile-tyk-plugin-base-wolfi","flavour":"Wolfi","slim":"0"}'
+          # slim = the DHI base with the SLIM purge applied (Debian cruft removed, scanner manifest
+          # reconciled, curl omitted). Same upstream base + cross toolchains as DHI; SLIM=1 gates it.
+          slim='{"variant":"slim","base":"'"${DHI_BASE}"'","suffix":"-base-slim","title":"compile-tyk-plugin-base-slim","flavour":"DHI (slim)","slim":"1"}'
+          # VARIANT is a single keyword (all|dhi|wolfi|slim) OR a space-separated subset - the
+          # watcher passes e.g. "dhi slim" because slim shares the DHI upstream digest and so
+          # re-bases whenever DHI does. "all" (the default) expands to all three.
+          req="${VARIANT:-all}"; [ "$req" = "all" ] && req="dhi wolfi slim"
+          entries=""
+          for v in $req; do
+            case "$v" in
+              dhi)   entries="$entries,$dhi"   ;;
+              wolfi) entries="$entries,$wolfi" ;;
+              slim)  entries="$entries,$slim"  ;;
+              *)     echo "::warning::unknown base variant '$v' (skipped)" ;;
+            esac
+          done
+          [ -n "$entries" ] || { echo "::error::no valid base variant in '$req'"; exit 1; }
+          printf 'matrix=[%s]\n' "${entries#,}" >> "$GITHUB_OUTPUT"
 
   base:
     needs: plan
@@ -140,6 +155,7 @@ jobs:
             BASE_IMAGE=${{ matrix.base }}@${{ steps.up.outputs.digest }}
             DHI_DIGEST=${{ steps.up.outputs.digest }}
             GLIBC_TARGET=${{ inputs.glibc_target || '2.17' }}
+            SLIM=${{ matrix.slim }}
           tags: |
             ghcr.io/${{ env.GHCR_NS }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}:latest${{ needs.plan.outputs.glibc_suffix }}
             docker.io/${{ vars.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}:latest${{ needs.plan.outputs.glibc_suffix }}

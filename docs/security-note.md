@@ -31,11 +31,39 @@ The new image's CRITICALs were **100% perl** - two CVEs with **no upstream fix**
   `v5.13.0` from the tag); that is now done in **bash** (`BASH_REMATCH`), and `git`
   is **opt-out** (`WITH_GIT=0`) since the default proxy-based `go get` needs no git.
   Dropping git -> **CRITICAL 8 -> 2, HIGH 51 -> 36** (measured).
-- **2 of 8** are `perl-base`, which is `Priority: required` on Debian and cannot be
-  removed without breaking dpkg/debconf. These are unavoidable on *any* Debian base.
+- **2 of 8** are `perl-base`, which is `Priority: required` on Debian. Plain `apt-get
+  remove` leaves it, but it **is** removable with `apt-get purge --allow-remove-essential`
+  (we don't need dpkg/debconf at runtime in a finished image) - the **`-slim`** variant does
+  exactly this, so perl is gone there too (see below). It survives only if you don't go out
+  of your way to drop it.
 - **Switching `BASE_IMAGE` to Wolfi removes perl entirely -> 0 perl CVEs** (verified:
   `cgr.dev/chainguard/wolfi-base` has no perl, and `apk add gcc glibc-dev binutils`
   installs a glibc toolchain without pulling perl).
+
+### The `-slim` variant ships this on the DHI base
+
+The published **`-slim`** tag realizes this CVE reduction on the **default DHI base** - and,
+unlike the `WITH_GIT=0` route above, **without dropping git** (so git-based `go get` still
+works). Instead of removing git, slim removes the unused packages directly:
+
+- Purges the packages the compiler never uses at runtime, files and all (not just a manifest
+  entry): the perl family (`perl`, `perl-base`, `perl-modules`, and the orphaned `libperl`
+  runtime - its only consumer was perl), plus `gpgv` and `ncurses-base/bin/term`.
+- Omits `curl` - Go is fetched at build time via BuildKit `ADD` + `sha256sum` (trust anchor
+  unchanged: go.dev + the pinned checksum).
+- Reconciles DHI's distroless `/var/lib/dpkg/status.d/` scanner manifest **only** for packages
+  actually removed - never clearing an entry whose files remain (that would hide a real package).
+
+Measured on the DHI base (arm64, raw Trivy 0.71, no VEX): **9 CRITICAL / 77 HIGH -> 1 CRITICAL
+/ 58 HIGH**. The one remaining critical is `linux-libc-dev` (kernel UAPI headers - required for
+native CGO's `<linux/errno.h>`, kept and left honestly reported). git's
+`libexpat`/`libcurl`/`libssh2`, the essential `libssl3`/`openssl`/`libsqlite3`, `libtinfo6`
+(bash) and the Go `stdlib` stay because they are in use. Nothing is suppressed or VEX'd.
+
+A more minimal base (e.g. busybox) was evaluated and not pursued - the scan count is dominated
+by `binutils` (540) and `linux-libc-dev` (353) that any cross-compiler carries, and the real
+blocker to a lower scan was this `status.d` manifest, not the base. See
+[`base-images.md`](base-images.md) for the full reasoning.
 
 ## Why the findings drop (and why it is structural)
 
@@ -87,11 +115,15 @@ The default target is documented in [`glibc-targets.md`](glibc-targets.md).
 - **trixie base + gcc/binutils + cross gcc**: the irreducible compile toolchain.
 - **glibc-2.17 sysroot files**: build inputs (see above).
 
-## Further hardening (documented, not yet applied)
+## Further hardening (some now shipped as variants)
+
+Two of the items below now ship as published variants (see [`base-images.md`](base-images.md)):
+the **`-slim`** tag applies the unused-package purge + manifest reconcile + curl removal on the
+DHI base, and the **`-wolfi`** tag is the Chainguard base switch. The rest remain opt-in:
 
 - Drop `g++`/C++ cross unless C++ CGO plugins are required (`ARG WITH_CXX=0`).
 - Switch `BASE_IMAGE` to `cgr.dev/chainguard/wolfi-base` for a near-zero-CVE,
-  continuously-rebuilt glibc base (trade-off: rolling, pin by digest).
+  continuously-rebuilt glibc base (trade-off: rolling, pin by digest) - **shipped as `-wolfi`**.
 - Strip debug info from the baked Gateway self-test binary, or omit it from the
   shipped image (build it in a throwaway stage used only for CI load-tests).
 - `--no-install-recommends` everywhere (already applied) + remove `apt`/lists in the

@@ -23,15 +23,17 @@ ARG GO_VERSION
 ARG TARGETARCH
 ARG GO_SHA256_amd64
 ARG GO_SHA256_arm64
+# Fetch Go via BuildKit's ADD (no curl/openssl needed in the image) and verify against the
+# pinned sha. Trust anchor unchanged: the go.dev tarball + the checksum resolve-gateway.sh read
+# from go.dev's signed release index. ADD can't take a per-arch --checksum, so we verify in the
+# RUN with sha256sum (coreutils). GO_VERSION already carries the "go" prefix (e.g. go1.25.10).
+ADD https://go.dev/dl/${GO_VERSION}.linux-${TARGETARCH}.tar.gz /tmp/go.tgz
 RUN set -eux; \
-    v="${GO_VERSION#go}"; \
     case "${TARGETARCH}" in \
       amd64) sha="${GO_SHA256_amd64}";; \
       arm64) sha="${GO_SHA256_arm64}";; \
       *) echo "compiler image only builds for amd64/arm64 hosts (got ${TARGETARCH})" >&2; exit 1;; \
     esac; \
-    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 30 \
-      "https://go.dev/dl/go${v}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz; \
     echo "${sha}  /tmp/go.tgz" | sha256sum -c -; \
     mkdir -p /usr/local; tar -C /usr/local -xzf /tmp/go.tgz; rm /tmp/go.tgz; \
     /usr/local/go/bin/go version

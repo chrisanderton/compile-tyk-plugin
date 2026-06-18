@@ -45,8 +45,10 @@ Docker automatically pulls the native amd64 or arm64 image for your host.
 | Compiler tag | Use when |
 |---|---|
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z` | Default choice. DHI-based, amd64+arm64 image, cross-targets amd64/arm64/s390x. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-slim` | Same DHI base + cross toolchains, trimmed for a lower CVE count. Cross-targets amd64/arm64/s390x. See [`docs/base-images.md`](docs/base-images.md). |
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi` | Wolfi/Chainguard base. Native amd64/arm64 only; no s390x cross target. |
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-YYYYMMDD` | Immutable snapshot of the default tag for reproducible builds. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-slim-YYYYMMDD` | Immutable snapshot of the slim tag. |
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi-YYYYMMDD` | Immutable snapshot of the Wolfi tag. |
 
 `vX.Y.Z` is your Tyk Gateway version, for example `v5.13.0`.
@@ -191,7 +193,8 @@ details live in the dedicated docs:
   base/release split.
 - [`docs/custom-gateway.md`](docs/custom-gateway.md) - building a compiler for a custom
   Gateway.
-- [`docs/base-images.md`](docs/base-images.md) - DHI vs Wolfi base variants.
+- [`docs/base-images.md`](docs/base-images.md) - DHI, slim and Wolfi base variants (and why
+  not busybox).
 - [`docs/compatibility.md`](docs/compatibility.md) - ABI and load-test evidence.
 - [`docs/glibc-targets.md`](docs/glibc-targets.md) - default glibc floor and rare
   opt-in higher floors.

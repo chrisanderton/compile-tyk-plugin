@@ -123,24 +123,80 @@ ARG WITH_GIT=1
 # Digest of the DHI base this image was built from - the watcher compares this to
 # the live DHI digest to decide when to re-stack (CVE patch) on a new base.
 ARG DHI_DIGEST=unknown
+# Variant selector. SLIM=0 (default) -> the standard DHI base (full toolchain incl. curl,
+# nothing purged) = the :V images. SLIM=1 -> the -slim base: same DHI base, but the unused
+# cruft below is purged + the scanner manifest reconciled, and curl is omitted (Go is fetched
+# via BuildKit ADD in Dockerfile.release, so the build never needs it) = the :V-slim images.
+# The default path is byte-for-byte the current DHI build; -slim is purely additive/opt-in.
+ARG SLIM=0
 RUN set -eux; \
     if command -v apt-get >/dev/null; then \
         apt-get update; \
         # binutils-gold: OLD Go (<1.18) links -buildmode=plugin for the NATIVE arch with
         # -fuse-ld=gold; without ld.gold the external link fails "cannot find 'ld'". See build.sh.
-        pkgs="bash jq ca-certificates curl binutils binutils-gold file make \
+        pkgs="bash jq ca-certificates binutils binutils-gold file make \
               gcc gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu gcc-s390x-linux-gnu"; \
+        # default keeps curl; the -slim variant omits it (Go is fetched via BuildKit ADD in
+        # Dockerfile.release, so curl is never needed to build). ca-certificates always stays
+        # (Go module HTTPS). NB: even in -slim, git pulls libcurl/libssh2 and apt/coreutils/
+        # ca-certificates pull libssl3/openssl, so those remain regardless.
+        [ "$SLIM" = "1" ] || pkgs="$pkgs curl"; \
         [ "$WITH_CXX" = "1" ] && pkgs="$pkgs g++ g++-x86-64-linux-gnu g++-aarch64-linux-gnu g++-s390x-linux-gnu"; \
         [ "$WITH_GIT" = "1" ] && pkgs="$pkgs git"; \
         apt-get install -y --no-install-recommends $pkgs; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null; then \
-        pkgs="bash jq ca-certificates curl binutils file make gcc glibc-dev"; \
+        pkgs="bash jq ca-certificates binutils file make gcc glibc-dev"; \
+        [ "$SLIM" = "1" ] || pkgs="$pkgs curl"; \
         [ "$WITH_GIT" = "1" ] && pkgs="$pkgs git"; \
         apk add --no-cache $pkgs; \
         # Wolfi: gcc includes C++; cross-gcc is not packaged, so a Wolfi image builds \
         # NATIVELY for its own arch only (amd64 image -> amd64, arm64 -> arm64). \
         # Cross targets (s390x, opposite arch) require the Debian/DHI base. \
+    fi
+
+# --- slim (Debian/DHI only): drop base packages the compiler never uses at runtime, and
+# RECONCILE the distroless scanner manifest so the reduction is visible to scanners. DHI's
+# debian-base tracks packages in /var/lib/dpkg/status.d/<pkg> (which apt/dpkg never update)
+# and bakes an SBOM under /opt/docker/sbom; scanners read both, so a bare purge leaves them
+# reporting packages whose files are already gone. We delete the files AND the stale manifest
+# entries - only for packages we actually remove, never hiding anything still present.
+# KEEP: libtinfo6 (bash needs it) and linux-libc-dev (native cgo's <errno.h> pulls
+# <linux/errno.h>; cross builds use the 2.17 sysroot's own headers). curl is already omitted
+# from the -slim install list above. Only runs when SLIM=1 (the -slim base); the default DHI
+# base skips this entirely. We do NOT suppress anything: the residual linux-libc-dev findings
+# (~1 CRITICAL + ~37 HIGH) stay VISIBLE - they are kernel-UAPI-header CVEs (no kernel runs in
+# this image), but we keep the package because native cgo needs it, so we leave them honestly
+# reported rather than VEX them out. build.sh + validate-plugin.sh invoke none of the dropped pkgs.
+RUN set -eux; \
+    if [ "$SLIM" = "1" ] && command -v dpkg-query >/dev/null; then \
+      # Purge unused packages that are in the LIVE dpkg db (so apt removes their FILES - honest,
+      # not just a manifest edit). Matched dynamically via `dpkg-query -W | cut -f1` so version-
+      # suffixed names (perl-modules-5.40) are caught; ${} is avoided because BuildKit would blank
+      # it as an undefined build-arg. Only packages with no needed consumer are listed - libexpat1
+      # (git), libsqlite3-0 (PAM/coreutils), libssl3/openssl (apt/ca-certs) are deliberately NOT
+      # here: they are in use and stay honestly reported. perl's orphaned runtime is swept below.
+      pat='^(perl|perl-base|perl-modules.*|libperl[0-9.]+|gpgv|ncurses-(base|bin|term))$'; \
+      # cut -f1 then strip dpkg-query's :arch suffix on Multi-Arch pkgs (libperl5.40:arm64) so the
+      # pattern matches - else libperl (perl's runtime, carrying perl's CVEs) is silently missed.
+      # libperl is safe to purge (rdeps: only perl, also dropped); libexpat1/libsqlite3-0/libssl3
+      # are deliberately excluded - they are in use (git/PAM/apt) and stay honestly reported.
+      drop="$(dpkg-query -W 2>/dev/null | cut -f1 | sed 's/:[^:]*$//' | grep -E "$pat" || true)"; \
+      if [ -n "$drop" ]; then \
+        apt-get purge -y --allow-remove-essential $drop 2>/dev/null || true; \
+        dpkg --purge --force-all $drop 2>/dev/null || true; \
+        apt-get autoremove -y --purge 2>/dev/null || true; \
+      fi; \
+      # Reconcile the distroless scanner manifest ONLY for packages we actually purged above
+      # (apt removed their files; it leaves the status.d entry stale). NEVER clear an entry whose
+      # files remain - that would hide a real, present package. Libs like libperl/libexpat/
+      # libsqlite3 are status.d-only with files in use (git/essentials need them), so they are
+      # NOT in $drop, keep their entries, and stay honestly reported.
+      for p in $drop; do rm -f "/var/lib/dpkg/status.d/$p"; done; \
+      rm -rf /opt/docker/sbom /var/lib/apt/lists/*; \
+      for need in gcc x86_64-linux-gnu-gcc aarch64-linux-gnu-gcc s390x-linux-gnu-gcc ld jq file make bash git; do \
+        command -v "$need" >/dev/null 2>&1 || { echo "ERROR: slim removed a required tool: $need" >&2; exit 1; }; \
+      done; \
     fi
 
 COPY --from=sysroots /opt/tyk/sysroots /opt/tyk/sysroots

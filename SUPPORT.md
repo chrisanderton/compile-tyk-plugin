@@ -18,9 +18,11 @@ is a reviewed change to that file - the git history is the lifecycle audit trail
 
 ## Tags & reproducibility
 
-For each supported version `V` and variant (default = Docker Hardened Image; `-wolfi`):
+For each supported version `V` and variant (default = Docker Hardened Image; `-slim` = same
+DHI base trimmed for a lower CVE count; `-wolfi` = Chainguard, native-only) - see
+[`docs/base-images.md`](docs/base-images.md):
 
-- **`:V`** (and `:V-wolfi`) - **moving**, always the latest-patched build. **Track this for security currency.**
+- **`:V`** (and `:V-slim`, `:V-wolfi`) - **moving**, always the latest-patched build. **Track this for security currency.**
 - **`:V-YYYYMMDD`** - **immutable** snapshot. Retained **`snapshot_retention_days`** (default **14 days**)
   for actively-updated versions; frozen/retired versions keep only their latest snapshot. Pin these
   (or a digest) for a reproducible point-in-time build.
