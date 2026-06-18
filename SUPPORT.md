@@ -18,16 +18,17 @@ is a reviewed change to that file - the git history is the lifecycle audit trail
 
 ## Tags & reproducibility
 
-For each supported version `V` and variant (default = Docker Hardened Image; `-slim` = same
-DHI base trimmed for a lower CVE count; `-wolfi` = Chainguard, native-only) - see
-[`docs/base-images.md`](docs/base-images.md):
+For each supported version `V` and variant (default = busybox-glibc, native-only; `-x` = same
+busybox-glibc base plus cross toolchains, cross-compiles amd64/arm64/s390x; `-wolfi` =
+Chainguard, native-only) - see [`docs/base-images.md`](docs/base-images.md):
 
-- **`:V`** (and `:V-slim`, `:V-wolfi`) - **moving**, always the latest-patched build. **Track this for security currency.**
+- **`:V`** (and `:V-x`, `:V-wolfi`) - **moving**, always the latest-patched build. **Track this for security currency.**
 - **`:V-YYYYMMDD`** - **immutable** snapshot. Retained **`snapshot_retention_days`** (default **14 days**)
   for actively-updated versions; frozen/retired versions keep only their latest snapshot. Pin these
   (or a digest) for a reproducible point-in-time build.
-- **Editions** are selected at build time (`-e EDITION=ce|ee|ee-fips`); **architectures** via `-e GOARCH`
-  (amd64/arm64/s390x). Advanced glibc-floor variants are documented in
+- **Editions** are selected at build time (`-e EDITION=ce|ee|ee-fips`); **target architectures**
+  via `-e GOARCH` (the default tag builds for its own host arch; use `-x` for cross-targets
+  amd64/arm64/s390x). Optional glibc-floor variants are documented in
   [`docs/glibc-targets.md`](docs/glibc-targets.md).
 
 **Guarantee:** because a compiler is fully reproducible from its Gateway version, **any supported
@@ -51,8 +52,8 @@ A successful **compile does not guarantee a successful load** for FIPS; that one
 ## Currency
 
 Maintained/extra (ACTIVE) builders are rebuilt whenever the hardened base ships a CVE fix, so the
-moving tag stays low-CVE. The DHI and Wolfi bases are tracked independently. Each image carries an
-SPDX SBOM + SLSA provenance attestation.
+moving tag stays low-CVE. The busybox-glibc and Wolfi bases are tracked independently. Each image
+carries an SPDX SBOM + SLSA provenance attestation.
 
 ## Lifecycle (how to change support)
 

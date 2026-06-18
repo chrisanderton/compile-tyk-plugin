@@ -19,11 +19,11 @@ What it gives you:
   the output name, just like `tykio/tyk-plugin-compiler`.
 - **Native amd64 + arm64 images** - no `--platform=linux/amd64` needed on Apple Silicon
   or arm64 Linux runners.
-- **Docker Hardened Image base** - hardened, minimal, continuously patched. In our
-  measurements this means far fewer CVE-scanner findings (about 85-90% fewer
-  CRITICAL/HIGH).
-- **One image, many targets** - cross-compiles amd64/arm64/s390x and builds for the
-  **CE / EE / EE-FIPS** editions, all selected with a flag.
+- **Hardened, minimal base** - the default image is built on a Docker Hardened Image
+  (busybox-glibc), continuously patched, with a focused build-time toolchain.
+- **CE / EE / EE-FIPS editions** - all three editions selected with a single flag.
+- **Cross-compilation when you need it** - a dedicated `-x` variant cross-compiles
+  amd64/arm64/s390x; the default variant builds natively for its own arch.
 - **Old-glibc CGO compatibility as an isolated link sysroot** - plugins link against a
   pinned glibc-2.17 floor (RHEL 7 / CentOS 7 ABI) for broad portability, while the image
   itself stays modern and small.
@@ -44,11 +44,11 @@ Docker automatically pulls the native amd64 or arm64 image for your host.
 
 | Compiler tag | Use when |
 |---|---|
-| `chrisanderton/compile-tyk-plugin:vX.Y.Z` | Default choice. DHI-based, amd64+arm64 image, cross-targets amd64/arm64/s390x. |
-| `chrisanderton/compile-tyk-plugin:vX.Y.Z-slim` | Same DHI base + cross toolchains, trimmed for a lower CVE count. Cross-targets amd64/arm64/s390x. See [`docs/base-images.md`](docs/base-images.md). |
-| `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi` | Wolfi/Chainguard base. Native amd64/arm64 only; no s390x cross target. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z` | Default choice. busybox-glibc base, native-only (builds for its own host arch: amd64->amd64, arm64->arm64). |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-x` | Same busybox-glibc base **plus cross toolchains**; cross-compiles amd64/arm64/s390x. Use this when you need cross-compilation or s390x. See [`docs/base-images.md`](docs/base-images.md). |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi` | Wolfi/Chainguard base; lowest CVE count. Native amd64/arm64 only; no s390x, no cross. |
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-YYYYMMDD` | Immutable snapshot of the default tag for reproducible builds. |
-| `chrisanderton/compile-tyk-plugin:vX.Y.Z-slim-YYYYMMDD` | Immutable snapshot of the slim tag. |
+| `chrisanderton/compile-tyk-plugin:vX.Y.Z-x-YYYYMMDD` | Immutable snapshot of the cross-compiling tag. |
 | `chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi-YYYYMMDD` | Immutable snapshot of the Wolfi tag. |
 
 `vX.Y.Z` is your Tyk Gateway version, for example `v5.13.0`.
@@ -92,19 +92,22 @@ Advanced sysroot settings are documented in [`docs/glibc-targets.md`](docs/glibc
 Output naming matches the official convention: `{name}_{Gw-version}_{GOOS}_{GOARCH}.so`.
 
 ## Architectures & cross-compilation
-One image carries glibc sysroots + cross toolchains for **amd64, arm64, s390x**, so any
-target builds via `GOARCH` regardless of host:
+The **default** `:vX.Y.Z` tag is **native-only**: it builds for its own host arch
+(amd64->amd64, arm64->arm64). It is published amd64 + arm64, so Docker pulls the native
+image for your host. For CGO-heavy plugins, native is the preferred path.
+
+When you need a *different* target arch (or s390x), use the **`-x`** tag. It carries glibc
+sysroots + cross toolchains for **amd64, arm64, s390x**, so any target builds via `GOARCH`
+regardless of host:
 ```bash
 docker run --rm -e GOARCH=arm64 -v "$PWD:/plugin-source" \
-  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
+  chrisanderton/compile-tyk-plugin:vX.Y.Z-x my-plugin.so
 
 docker run --rm -e GOARCH=s390x -v "$PWD:/plugin-source" \
-  chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so  # big-endian, CE only
+  chrisanderton/compile-tyk-plugin:vX.Y.Z-x my-plugin.so  # big-endian, CE only
 ```
-The compiler image itself is published amd64 + arm64 (native on each); s390x is a
-cross target. Prefer the native image of the target arch for CGO-heavy plugins.
 
-The Wolfi tag, `vX.Y.Z-wolfi`, is native amd64/arm64 only. Use the default tag when you
+The Wolfi tag, `vX.Y.Z-wolfi`, is native amd64/arm64 only. Use the `-x` tag when you
 need s390x or cross-compilation in any direction.
 
 ## Editions: CE / EE / EE-FIPS
@@ -181,7 +184,8 @@ custom dependencies, custom build tags, or a different Go toolchain. See
 
 ## macOS / Apple Silicon
 Multi-arch, so it runs **natively** on arm64 Macs - no `--platform=linux/amd64` or
-emulation (unlike the legacy amd64-only image). Use `-e GOARCH=...` only to cross-compile.
+emulation (unlike the legacy amd64-only image). To cross-compile to a different target arch,
+use the `-x` tag with `-e GOARCH=...`.
 
 ---
 
@@ -193,8 +197,7 @@ details live in the dedicated docs:
   base/release split.
 - [`docs/custom-gateway.md`](docs/custom-gateway.md) - building a compiler for a custom
   Gateway.
-- [`docs/base-images.md`](docs/base-images.md) - DHI, slim and Wolfi base variants (and why
-  not busybox).
+- [`docs/base-images.md`](docs/base-images.md) - default, `-x` and Wolfi base variants.
 - [`docs/compatibility.md`](docs/compatibility.md) - ABI and load-test evidence.
 - [`docs/glibc-targets.md`](docs/glibc-targets.md) - default glibc floor and rare
   opt-in higher floors.
@@ -203,9 +206,9 @@ details live in the dedicated docs:
 ## Why this exists
 Enterprise CVE scanners flag a lot of findings on general-purpose builder images. This
 project takes a focused approach for the plugin-compilation job: a hardened, minimal
-**Docker Hardened Image** base, with old-glibc CGO compatibility kept as an **isolated
-link sysroot** rather than as the OS. The plugin output is equivalent, the image is
-modern and small, and scanner findings drop substantially. The official
+**Docker Hardened Image** (busybox-glibc) base, with old-glibc CGO compatibility kept as an
+**isolated link sysroot** rather than as the OS. The plugin output is equivalent, the image
+is modern and small, and scanner findings drop substantially. The official
 `tyk-plugin-compiler` is the Gateway's release builder and intentionally carries a
 broader toolchain for its wider role; this image only needs what plugin compilation
 requires. Compatibility evidence and the CVE comparison: **`docs/compatibility.md`**,
@@ -228,7 +231,7 @@ requires. Compatibility evidence and the CVE comparison: **`docs/compatibility.m
 
 ## Repo layout
 ```
-Dockerfile.base          stable layer: DHI + toolchains + glibc sysroots + scripts (no Go/source)
+Dockerfile.base          stable layer: busybox-glibc base + toolchains + glibc sysroots + scripts (no Go/source)
 Dockerfile.release       thin per-release layer: FROM base + exact Go + vendored Gateway source
 Dockerfile.proof         lean image to validate the sysroot/toolchain without the Gateway
 data/build.sh            entrypoint - drop-in interface, sysroot- & edition-aware
@@ -236,7 +239,7 @@ data/validate-plugin.sh  post-build validator (arch / Go / GLIBC / edition / dep
 scripts/                 resolve-gateway.sh, loadtest-gate.sh, e2e-compose.sh, validate-proof.sh, cve-compare.sh
 loadtest/                test-plugin + docker-compose for E2E
 proof/                   tiny CGO plugin for the proof-image toolchain validation
-.github/workflows/       build.yml + build-wolfi.yml (DHI + Wolfi pipelines), watch.yml (auto-trigger)
+.github/workflows/       build.yml + build-wolfi.yml (busybox-glibc + Wolfi pipelines), watch.yml (auto-trigger)
 docs/                    base-images.md, compatibility.md, glibc-targets.md, fips.md,
                          air-gapped.md, custom-gateway.md, maintenance.md, security-note.md
 ```

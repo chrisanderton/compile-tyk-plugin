@@ -32,33 +32,32 @@ docker run --rm -v "$PWD:/plugin-source" \
   chrisanderton/compile-tyk-plugin:vX.Y.Z my-plugin.so
 ```
 
-## Advanced: 2.31
+## Optional: a custom glibc floor (mechanism, not a recommendation)
 
-The 2.31 target exists for one narrow case: your plugin's own C or C++ code calls glibc
-functions that were added after 2.17 and no later than 2.31.
+The 2.17 default is the right floor for almost everyone, and a newer Gateway container does
+**not** require a higher one - newer glibc runtimes can load plugins built with the lower 2.17
+floor. The only case for raising the floor is narrow: your plugin's own C or C++ code calls a
+glibc function that was added after 2.17. The cost is reduced portability - the resulting plugin
+will not run on hosts older than the floor you pick (for example, no longer on RHEL 7).
 
-This is not a general upgrade path, and it is not needed to match modern Gateway
-containers. Newer glibc runtimes can load plugins built with the lower 2.17 floor.
+For that narrow case, the floor is **parameterized** - you can build against a different sysroot
+floor. `-glibc2.31` is simply *an example* of the mechanism; the `2.31` value is arbitrary and
+carries no special status. Any floor for which you can supply a matching sysroot works the same way.
 
-Use 2.31 only when you have a concrete C/C++ dependency that requires it. The cost is
-reduced portability: the resulting plugin will not run on RHEL 7 or any host with glibc
-older than 2.31.
+A custom-floor build is selected with the `GLIBC_TARGET` base build arg, and published as an
+optional suffixed tag (here the 2.31 example):
 
-Maintainers can publish or build opt-in tags with the glibc suffix:
-
-```text
-chrisanderton/compile-tyk-plugin:vX.Y.Z-glibc2.31
-chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi-glibc2.31
+```bash
+docker build -f Dockerfile.base --build-arg GLIBC_TARGET=2.31 .
 ```
-
-The same target is available as a workflow or base build input:
 
 ```yaml
 glibc_target: "2.31"
 ```
 
-```bash
-docker build -f Dockerfile.base --build-arg GLIBC_TARGET=2.31 .
+```text
+chrisanderton/compile-tyk-plugin:vX.Y.Z-glibc2.31
+chrisanderton/compile-tyk-plugin:vX.Y.Z-wolfi-glibc2.31
 ```
 
 Published images set `TYK_GLIBC_TARGET` for you. Override it only if you also provide a
@@ -79,5 +78,5 @@ into the exact Gateway build you will run:
 tyk plugin load -f my-plugin_vX.Y.Z_linux_amd64.so -s MySymbol
 ```
 
-If the default 2.17 build passes validation and loads, keep it. Move to 2.31 only when
+If the default 2.17 build passes validation and loads, keep it. Raise the floor only when
 validation fails because your plugin genuinely requires newer glibc symbols.

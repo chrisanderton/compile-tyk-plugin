@@ -5,10 +5,10 @@ name: prune
 # scripts/resolve-releases.sh) and keeps exactly that, with these retention rules:
 #   * out-of-policy version   -> delete ALL its tags (e.g. a patch that aged out of a maintained
 #                                line, or a line moved to `retired` so only its tip is kept)
-#   * kept version, moving tag (:vX.Y.Z, also -wolfi / -slim) -> always kept
+#   * kept version, moving tag (:vX.Y.Z, also -wolfi / -x) -> always kept
 #   * kept ACTIVE version, dated snapshots (:...-YYYYMMDD) -> keep those within snapshot_retention_days
 #   * kept FROZEN version, dated snapshots               -> keep only the newest one (per variant)
-# Never touches *-glibc2.31 opt-in tags, the -base/-base-wolfi/-base-slim packages, or buildcache.
+# Never touches *-glibc2.31 opt-in tags, the -base/-base-x/-base-wolfi packages, or buildcache.
 #
 # Because it enforces a REVIEWED file (not an inference), it is safe to run unattended. Editing
 # releases.yml is the deprecation decision; this just applies it. Still: run once with dry_run=true
@@ -64,8 +64,8 @@ jobs:
         run: |
           set -euo pipefail
           PKG="$IMAGE_NAME"
-          MOV_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-wolfi|-slim)?$'
-          DAT_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-wolfi|-slim)?-[0-9]{8}$'
+          MOV_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-wolfi|-x)?$'
+          DAT_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-wolfi|-x)?-[0-9]{8}$'
 
           # --- the policy: ACTIVE / FROZEN / retention, from the shared resolver ---
           resolved="$(GW_CE_REPO="$GW_CE_REPO" SOURCE_REPO="$SOURCE_REPO" bash scripts/resolve-releases.sh)"
@@ -88,7 +88,7 @@ jobs:
           del_list=""
           for t in $all_tags; do
             ver="$(printf '%s' "$t" | sed -E 's/^(v[0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-            rest="${t#"$ver"}"; variant=""; case "$rest" in -wolfi*) variant="-wolfi";; -slim*) variant="-slim";; esac
+            rest="${t#"$ver"}"; variant=""; case "$rest" in -wolfi*) variant="-wolfi";; -x*) variant="-x";; esac
             date="$(printf '%s' "$t" | grep -oE '[0-9]{8}$' || true)"
             if ! printf '%s\n' "$keep" | grep -qx "$ver"; then del_list="$del_list $t"; continue; fi   # out of policy
             [ -z "$date" ] && continue                                                                  # moving tag of a kept version: keep

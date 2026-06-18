@@ -16,7 +16,10 @@ ARG SYSROOT_SUITE=bullseye
 # is built (its cgo is linked with the CentOS 7 gcc 4.8.5 / glibc 2.17 toolchain). 2.31 =
 # Debian bullseye - opt-in, for plugins whose C code needs a glibc 2.18-2.31 function.
 ARG GLIBC_TARGET=2.17
-ARG BASE_IMAGE=dhi.io/debian-base:trixie-debian13-dev
+# DHI busybox-glibc base (free, non-FIPS). SWAP to dhi.io/busybox:1-debian-fips-dev once the org
+# is entitled to the gated FIPS tags - same Debian/glibc lineage, drop-in. FIPS plugin crypto comes
+# from the Go toolchain (GOFIPS140/boringcrypto), not the base, so a non-FIPS base is correct today.
+ARG BASE_IMAGE=dhi.io/busybox:1-debian-dev
 
 ############################################################################
 # Stage 1 - glibc link sysroots (amd64 + arm64 + s390x). Two sources, selected by
@@ -117,45 +120,58 @@ FROM sysroots-${GLIBC_TARGET} AS sysroots
 # Stage 2 - the base toolchain image (no Go, no Gateway source)
 ############################################################################
 FROM ${BASE_IMAGE} AS base
+# DHI bases default to a non-root user; the compiler needs root to apt-install the toolchain at
+# build time and to write build artifacts + the mounted /plugin-source volume at run time.
+USER root
 ARG GLIBC_TARGET
 ARG WITH_CXX=1
 ARG WITH_GIT=1
 # Digest of the DHI base this image was built from - the watcher compares this to
 # the live DHI digest to decide when to re-stack (CVE patch) on a new base.
 ARG DHI_DIGEST=unknown
-# Variant selector. SLIM=0 (default) -> the standard DHI base (full toolchain incl. curl,
-# nothing purged) = the :V images. SLIM=1 -> the -slim base: same DHI base, but the unused
-# cruft below is purged + the scanner manifest reconciled, and curl is omitted (Go is fetched
-# via BuildKit ADD in Dockerfile.release, so the build never needs it) = the :V-slim images.
-# The default path is byte-for-byte the current DHI build; -slim is purely additive/opt-in.
-ARG SLIM=0
+# Two orthogonal axes:
+#   CROSS (default 0) -> native-only image: host-arch toolchain only = the :V images (build for
+#     their own arch). CROSS=1 -> the -x image: adds the amd64/arm64/s390x cross toolchains =
+#     the :V-x images (cross-compile to any target).
+#   SLIM (default 1) -> purge unused Debian packages + reconcile the scanner manifest (drops
+#     perl/gpgv/ncurses -> ~1 CRIT). EXIT RAMP: rebuild with SLIM=0 to ship WITHOUT the purge if a
+#     future base bump ever makes the purge unsafe - nothing depends on it functionally. The Wolfi
+#     (apk) base has no dpkg and skips the purge regardless.
+ARG SLIM=1
+ARG CROSS=0
 RUN set -eux; \
     if command -v apt-get >/dev/null; then \
         apt-get update; \
-        # binutils-gold: OLD Go (<1.18) links -buildmode=plugin for the NATIVE arch with
-        # -fuse-ld=gold; without ld.gold the external link fails "cannot find 'ld'". See build.sh.
-        pkgs="bash jq ca-certificates binutils binutils-gold file make \
-              gcc gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu gcc-s390x-linux-gnu"; \
-        # default keeps curl; the -slim variant omits it (Go is fetched via BuildKit ADD in
-        # Dockerfile.release, so curl is never needed to build). ca-certificates always stays
-        # (Go module HTTPS). NB: even in -slim, git pulls libcurl/libssh2 and apt/coreutils/
-        # ca-certificates pull libssl3/openssl, so those remain regardless.
-        [ "$SLIM" = "1" ] || pkgs="$pkgs curl"; \
-        [ "$WITH_CXX" = "1" ] && pkgs="$pkgs g++ g++-x86-64-linux-gnu g++-aarch64-linux-gnu g++-s390x-linux-gnu"; \
+        # GNU userspace: this is a busybox base, so install real coreutils/sed/grep/gawk/findutils/
+        # tar/gzip - build.sh + validate-plugin.sh assume GNU tools, not busybox applets. bash, jq,
+        # binutils (+gold: OLD Go <1.18 links a NATIVE -buildmode=plugin with -fuse-ld=gold, else
+        # the external link dies "cannot find 'ld'"), file, make and native gcc are always needed.
+        # curl is intentionally omitted (Go is fetched via BuildKit ADD in Dockerfile.release);
+        # ca-certificates stays (Go module HTTPS), and git pulls libcurl/libssh2 regardless.
+        pkgs="bash jq ca-certificates coreutils sed grep gawk findutils tar gzip \
+              binutils binutils-gold file make gcc"; \
+        # CROSS=1 (the -x variant) adds the cross toolchains for amd64/arm64/s390x; CROSS=0 ships
+        # native gcc only -> build.sh builds the host arch and fails fast on a cross target (the
+        # same native-only path the Wolfi variant uses).
+        if [ "$CROSS" = "1" ]; then \
+            pkgs="$pkgs gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu gcc-s390x-linux-gnu"; \
+            [ "$WITH_CXX" = "1" ] && pkgs="$pkgs g++ g++-x86-64-linux-gnu g++-aarch64-linux-gnu g++-s390x-linux-gnu"; \
+        else \
+            [ "$WITH_CXX" = "1" ] && pkgs="$pkgs g++"; \
+        fi; \
         [ "$WITH_GIT" = "1" ] && pkgs="$pkgs git"; \
         apt-get install -y --no-install-recommends $pkgs; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null; then \
         pkgs="bash jq ca-certificates binutils file make gcc glibc-dev"; \
-        [ "$SLIM" = "1" ] || pkgs="$pkgs curl"; \
         [ "$WITH_GIT" = "1" ] && pkgs="$pkgs git"; \
         apk add --no-cache $pkgs; \
         # Wolfi: gcc includes C++; cross-gcc is not packaged, so a Wolfi image builds \
         # NATIVELY for its own arch only (amd64 image -> amd64, arm64 -> arm64). \
-        # Cross targets (s390x, opposite arch) require the Debian/DHI base. \
+        # Cross targets (s390x, opposite arch) require the busybox-glibc -x variant. \
     fi
 
-# --- slim (Debian/DHI only): drop base packages the compiler never uses at runtime, and
+# --- SLIM purge (busybox-glibc only): drop base packages the compiler never uses at runtime, and
 # RECONCILE the distroless scanner manifest so the reduction is visible to scanners. DHI's
 # debian-base tracks packages in /var/lib/dpkg/status.d/<pkg> (which apt/dpkg never update)
 # and bakes an SBOM under /opt/docker/sbom; scanners read both, so a bare purge leaves them
@@ -163,8 +179,8 @@ RUN set -eux; \
 # entries - only for packages we actually remove, never hiding anything still present.
 # KEEP: libtinfo6 (bash needs it) and linux-libc-dev (native cgo's <errno.h> pulls
 # <linux/errno.h>; cross builds use the 2.17 sysroot's own headers). curl is already omitted
-# from the -slim install list above. Only runs when SLIM=1 (the -slim base); the default DHI
-# base skips this entirely. We do NOT suppress anything: the residual linux-libc-dev findings
+# from the install list above. Runs when SLIM=1 (the default; the SLIM=0 exit ramp skips it). The
+# Wolfi/apk base has no dpkg and skips it regardless. We do NOT suppress anything: residual findings
 # (~1 CRITICAL + ~37 HIGH) stay VISIBLE - they are kernel-UAPI-header CVEs (no kernel runs in
 # this image), but we keep the package because native cgo needs it, so we leave them honestly
 # reported rather than VEX them out. build.sh + validate-plugin.sh invoke none of the dropped pkgs.
@@ -194,8 +210,10 @@ RUN set -eux; \
       # NOT in $drop, keep their entries, and stay honestly reported.
       for p in $drop; do rm -f "/var/lib/dpkg/status.d/$p"; done; \
       rm -rf /opt/docker/sbom /var/lib/apt/lists/*; \
-      for need in gcc x86_64-linux-gnu-gcc aarch64-linux-gnu-gcc s390x-linux-gnu-gcc ld jq file make bash git; do \
-        command -v "$need" >/dev/null 2>&1 || { echo "ERROR: slim removed a required tool: $need" >&2; exit 1; }; \
+      needs="gcc ld jq file make bash git sed awk grep"; \
+      [ "$CROSS" = "1" ] && needs="$needs x86_64-linux-gnu-gcc aarch64-linux-gnu-gcc s390x-linux-gnu-gcc"; \
+      for need in $needs; do \
+        command -v "$need" >/dev/null 2>&1 || { echo "ERROR: SLIM purge removed a required tool: $need" >&2; exit 1; }; \
       done; \
     fi
 

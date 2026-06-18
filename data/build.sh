@@ -77,9 +77,9 @@ esac
 if ! command -v "$GNU_CC" >/dev/null 2>&1; then
   if [ "$GOOS" = "linux" ] && [ "$GOARCH" != "$HOST_ARCH" ]; then
     echo "ERROR: cannot build for linux/$GOARCH - this image has no cross toolchain ('$GNU_CC' is not installed)." >&2
-    echo "       This is a NATIVE-ONLY image (e.g. the Wolfi variant): it builds for its host arch ($HOST_ARCH) only." >&2
+    echo "       This is a NATIVE-ONLY image (the default :vX.Y.Z, or the Wolfi variant): it builds for its host arch ($HOST_ARCH) only." >&2
     echo "       Fix: build for $HOST_ARCH (drop '-e GOARCH', or set GOARCH=$HOST_ARCH)," >&2
-    echo "            OR use the default (DHI) image, which cross-compiles to amd64/arm64/s390x." >&2
+    echo "            OR use the -x image (:vX.Y.Z-x), which cross-compiles to amd64/arm64/s390x." >&2
     exit 1
   fi
   GNU_CC=$(go env CC)   # native target, no triplet-named gcc -> the plain native gcc is correct

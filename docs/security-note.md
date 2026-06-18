@@ -4,80 +4,72 @@ This note explains why a purpose-built plugin-compiler image produces far fewer
 CVE-scanner findings than a general-purpose Gateway release builder, and why that
 reduction is structural rather than cosmetic.
 
-## Headline (measured, Trivy 0.71, full severity range)
+## Headline: the two-number story (measured, Trivy v5.13.0)
 
-| Metric | Release builder | This image (trixie, +git) | This image (trixie, no git) | This image (Wolfi)* |
-|---|---:|---:|---:|---:|
-| CRITICAL | 16 | 8 | **2** | **0** |
-| HIGH | 380 | 51 | **36** | low |
-| **CRIT+HIGH** | **396** | 59 (-85%) | **38 (-90%)** | - |
-| Total findings | 3699 | 1024 (-72%) | fewer | fewest |
-| Installed OS packages | 364 | 185 | ~175 | ~minimal |
+The single most important framing is what happens under `--ignore-unfixed` - dropping
+advisories with no fix available. **Every variant collapses to the same ~27 findings, all of
+it the shared Go stdlib.** The *actionable, fixable* surface is identical across variants:
 
-"Release builder" = the official `tyk-plugin-compiler@sha256:ce908f76...` (a
-goreleaser-cross image that also builds and packages the Gateway). "This image" =
-`debian:trixie-slim` + a glibc-2.17 link sysroot (the DHI base gives comparable
-numbers - see `docs/base-images.md`). \*Wolfi = `cgr.dev/chainguard/wolfi-base` (measured:
-no perl in the base even after installing gcc 16.1 + glibc-dev - see below). A
-package-count comparison is not strictly apples-to-apples, since the release builder
-does more than compile plugins; the point is that a focused base carries less.
+| Variant | Base | Raw full scan (CRIT / HIGH / total) | `--ignore-unfixed` (actionable) |
+|---|---|---:|---:|
+| Default | busybox-glibc, native | ~1 / ~49 / ~1000 | **~27 (Go stdlib)** |
+| `-x` | busybox-glibc + cross | ~1 / ~49 / ~1100 | **~27 (Go stdlib)** |
+| `-wolfi` | Chainguard Wolfi, native | 0 / 9 / 27 | **~27 (Go stdlib)** |
 
-### What the CRITICALs actually are (and how they go to 0)
-The new image's CRITICALs were **100% perl** - two CVEs with **no upstream fix**
-(`CVE-2026-42496`, `CVE-2026-8376`) counted across the perl packages:
+The large raw counts on the busybox-glibc variants are almost entirely **unfixed distro noise**:
+the won't-fix `linux-libc-dev` kernel-UAPI-header attribution and (on `-x`) the cross-target
+binutils BFD-parser advisories. In a build-time image - no kernel, no runtime network services -
+that noise is benign. "Unfixed" is not "harmless" in general, but for this image it genuinely is.
+The Go stdlib 27 is shared by every variant because it is the pinned Go toolchain, which matches
+the Gateway's own Go (an ABI requirement).
 
-- **6 of 8** come from *full* perl, which Debian's **`git`** pulls in transitively
-  (`git -> liberror-perl -> perl`). build.sh used perl for a single line (parsing
-  `v5.13.0` from the tag); that is now done in **bash** (`BASH_REMATCH`), and `git`
-  is **opt-out** (`WITH_GIT=0`) since the default proxy-based `go get` needs no git.
-  Dropping git -> **CRITICAL 8 -> 2, HIGH 51 -> 36** (measured).
-- **2 of 8** are `perl-base`, which is `Priority: required` on Debian. Plain `apt-get
-  remove` leaves it, but it **is** removable with `apt-get purge --allow-remove-essential`
-  (we don't need dpkg/debconf at runtime in a finished image) - the **`-slim`** variant does
-  exactly this, so perl is gone there too (see below). It survives only if you don't go out
-  of your way to drop it.
-- **Switching `BASE_IMAGE` to Wolfi removes perl entirely -> 0 perl CVEs** (verified:
-  `cgr.dev/chainguard/wolfi-base` has no perl, and `apk add gcc glibc-dev binutils`
-  installs a glibc toolchain without pulling perl).
+For context, the official `tyk-plugin-compiler` (a goreleaser-cross image that also builds and
+packages the Gateway) carries a much broader toolchain for its wider role, so a raw
+package-count comparison is not apples-to-apples; a focused plugin-compiler base carries less.
 
-### The `-slim` variant ships this on the DHI base
+### What the lone CRITICAL actually is
+On the busybox-glibc variants the single CRITICAL is **`linux-libc-dev`** - a Linux *kernel* CVE
+attributed to the kernel-UAPI-headers package. No kernel runs in a build image; the package is
+`#include`-only, required for native CGO's `<linux/errno.h>` (and the boringcrypto FIPS path), so
+it is kept and **honestly reported, not suppressed**. The `-wolfi` variant carries no kernel
+headers and reports 0 CRITICAL.
 
-The published **`-slim`** tag realizes this CVE reduction on the **default DHI base** - and,
-unlike the `WITH_GIT=0` route above, **without dropping git** (so git-based `go get` still
-works). Instead of removing git, slim removes the unused packages directly:
+### The `-x` variant adds only LOW noise
+The `-x` cross variant is the same busybox-glibc base **plus C cross toolchains**. Its
+criticals/highs are unchanged from the default; the extra ~100 raw findings are all **LOW**
+(cross-target binutils BFD-parser advisories) and are dropped entirely under `--ignore-unfixed`.
+
+### Package trimming on the busybox-glibc base
+
+Both busybox-glibc variants ship an unused-package purge so the scan reflects what is present:
 
 - Purges the packages the compiler never uses at runtime, files and all (not just a manifest
   entry): the perl family (`perl`, `perl-base`, `perl-modules`, and the orphaned `libperl`
   runtime - its only consumer was perl), plus `gpgv` and `ncurses-base/bin/term`.
 - Omits `curl` - Go is fetched at build time via BuildKit `ADD` + `sha256sum` (trust anchor
   unchanged: go.dev + the pinned checksum).
-- Reconciles DHI's distroless `/var/lib/dpkg/status.d/` scanner manifest **only** for packages
+- Reconciles the distroless `/var/lib/dpkg/status.d/` scanner manifest **only** for packages
   actually removed - never clearing an entry whose files remain (that would hide a real package).
 
-Measured on the DHI base (arm64, raw Trivy 0.71, no VEX): **9 CRITICAL / 77 HIGH -> 1 CRITICAL
-/ 58 HIGH**. The one remaining critical is `linux-libc-dev` (kernel UAPI headers - required for
-native CGO's `<linux/errno.h>`, kept and left honestly reported). git's
-`libexpat`/`libcurl`/`libssh2`, the essential `libssl3`/`openssl`/`libsqlite3`, `libtinfo6`
-(bash) and the Go `stdlib` stay because they are in use. Nothing is suppressed or VEX'd.
-
-A more minimal base (e.g. busybox) was evaluated and not pursued - the scan count is dominated
-by `binutils` (540) and `linux-libc-dev` (353) that any cross-compiler carries, and the real
-blocker to a lower scan was this `status.d` manifest, not the base. See
-[`base-images.md`](base-images.md) for the full reasoning.
+What stays does so because it is in use: `linux-libc-dev` (native CGO headers),
+`libexpat`/`libcurl`/`libssh2` (git's HTTPS/VCS transport), the essential
+`libssl3`/`openssl`/`libsqlite3`, `libtinfo6` (bash) and the Go `stdlib`. Nothing is suppressed
+or VEX'd. See [`base-images.md`](base-images.md) for the full reasoning.
 
 ## Why the findings drop (and why it is structural)
 
-1. **Current, supported base.** This image uses Debian 13 *trixie* (glibc 2.41), the
-   same lineage as the Gateway runtime. Many MEDIUM/LOW findings on an older base are
-   "fixed in a newer version" advisories that a current base does not carry. The
-   release builder is on Debian 11 *bullseye*, which is older.
+1. **Current, supported base.** This image uses a modern, continuously-patched hardened
+   glibc base (DHI busybox-glibc), the same libc lineage as the Gateway runtime. Many
+   MEDIUM/LOW findings on an older base are "fixed in a newer version" advisories that a
+   current base does not carry. The release builder is on an older Debian, which carries more.
 
 2. **Only the toolchain plugin builds use.** This image installs gcc/binutils for the
    plugin's C/CGO needs. It does not include clang/LLVM. The release builder carries
    clang/LLVM for its own purposes, but plugin compilation does not use them.
 
-3. **Cross toolchains scoped to plugin targets.** This image carries C cross
-   toolchains for the architectures plugins target (amd64/arm64/s390x). The release
+3. **Cross toolchains scoped to plugin targets, and only when needed.** The default
+   variant is native-only and carries no cross toolchains at all. The `-x` variant carries
+   C cross toolchains for the architectures plugins target (amd64/arm64/s390x). The release
    builder also builds the Gateway itself for additional targets (for example
    powerpc64le), so it reasonably carries more.
 
@@ -100,7 +92,7 @@ provides that without running an old OS:
   never executed as the container's runtime libc.**
 - So it does **not** appear in the image's OS package inventory, and it does not bring
   along an older base's wider userspace of packages.
-- The **running** userspace is modern trixie (glibc 2.41) - what scanners inventory
+- The **running** userspace is the modern hardened base's glibc - what scanners inventory
   and what receives security updates.
 
 That is the distinction between linking against an old libc (a contained, file-level
@@ -112,14 +104,14 @@ The default target is documented in [`glibc-targets.md`](glibc-targets.md).
 - **Go toolchain**: Trivy attributes Go *stdlib* advisories to the pinned go1.25.10.
   These are unavoidable - the plugin **must** be built with the Gateway's exact Go
   version (ABI requirement). They are identical to the Gateway's own exposure.
-- **trixie base + gcc/binutils + cross gcc**: the irreducible compile toolchain.
+- **busybox-glibc base + gcc/binutils (+ cross gcc on `-x`)**: the irreducible compile toolchain.
 - **glibc-2.17 sysroot files**: build inputs (see above).
 
-## Further hardening (some now shipped as variants)
+## Further hardening (some baked in, some opt-in)
 
-Two of the items below now ship as published variants (see [`base-images.md`](base-images.md)):
-the **`-slim`** tag applies the unused-package purge + manifest reconcile + curl removal on the
-DHI base, and the **`-wolfi`** tag is the Chainguard base switch. The rest remain opt-in:
+The unused-package purge + manifest reconcile + curl removal is **baked into both busybox-glibc
+variants** (default and `-x`), and the **`-wolfi`** tag is the Chainguard base switch (see
+[`base-images.md`](base-images.md)). The rest remain opt-in:
 
 - Drop `g++`/C++ cross unless C++ CGO plugins are required (`ARG WITH_CXX=0`).
 - Switch `BASE_IMAGE` to `cgr.dev/chainguard/wolfi-base` for a near-zero-CVE,

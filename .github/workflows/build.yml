@@ -7,7 +7,7 @@ name: build
 #
 # The STABLE base layer is NOT built here - it is built once by build-base.yml and this
 # workflow just `FROM`s the published compile-tyk-plugin-base:latest. Run build-base.yml
-# (variant dhi) before the first build / after a base CVE bump; watch.yml orchestrates both.
+# (variant native, or all) before the first build / after a base CVE bump; watch.yml orchestrates both.
 #
 # Required configuration (Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USER   - repository VARIABLE: Docker Hub username + push namespace
@@ -23,11 +23,11 @@ on:
         required: true
         type: string
       variant:
-        description: "Image variant: dhi (default, full) or slim (low-CVE - Debian cruft purged, FROM -base-slim)"
+        description: "Image variant: default (busybox-glibc, native-only) or x (adds cross-compile to amd64/arm64/s390x, FROM -base-x)"
         required: false
         type: choice
-        options: [dhi, slim]
-        default: dhi
+        options: [default, x]
+        default: default
       push:
         description: "Push to registries"
         required: false
@@ -71,7 +71,7 @@ on:
       variant:
         required: false
         type: string
-        default: dhi
+        default: default
       push:
         required: false
         type: boolean
@@ -186,12 +186,13 @@ jobs:
           # never overwrites the canonical 2.17 default images (empty suffix => 2.17, untouched).
           g="${{ inputs.glibc_target }}"; g="${g:-2.17}"
           if [ "$g" = "2.17" ]; then echo "glibc_suffix=" >> "$GITHUB_OUTPUT"; else echo "glibc_suffix=-glibc$g" >> "$GITHUB_OUTPUT"; fi
-          # variant: dhi -> FROM '-base', unsuffixed tags; slim -> FROM '-base-slim', '-slim' tags.
+          # variant: default -> FROM '-base' (busybox-glibc, native-only), unsuffixed tags;
+          # x -> FROM '-base-x' (adds cross toolchains), '-x' tags.
           case "${{ inputs.variant }}" in
-            slim) echo "base_pkg_sfx=-base-slim" >> "$GITHUB_OUTPUT"; echo "var_sfx=-slim" >> "$GITHUB_OUTPUT"
-                  echo "var_desc=slimmed DHI base (same hardened base + cross toolchains, unused packages purged for a lower CVE count), glibc-2.17 sysroot" >> "$GITHUB_OUTPUT" ;;
-            *)    echo "base_pkg_sfx=-base"      >> "$GITHUB_OUTPUT"; echo "var_sfx="      >> "$GITHUB_OUTPUT"
-                  echo "var_desc=DHI base, glibc-2.17 sysroot default" >> "$GITHUB_OUTPUT" ;;
+            x)  echo "base_pkg_sfx=-base-x" >> "$GITHUB_OUTPUT"; echo "var_sfx=-x" >> "$GITHUB_OUTPUT"
+                echo "var_desc=busybox-glibc base + cross toolchains (amd64/arm64/s390x), glibc-2.17 sysroot" >> "$GITHUB_OUTPUT" ;;
+            *)  echo "base_pkg_sfx=-base"   >> "$GITHUB_OUTPUT"; echo "var_sfx="   >> "$GITHUB_OUTPUT"
+                echo "var_desc=busybox-glibc base, native-only, glibc-2.17 sysroot" >> "$GITHUB_OUTPUT" ;;
           esac
       # Pin the base built by build-base.yml. The compiler FROMs this exact digest and
       # inherits its io.ctp.dhi-base-digest label, so the gate + the watcher's level-trigger
@@ -212,14 +213,19 @@ jobs:
           CE_REPO: ${{ inputs.gateway_image_repo }}
           EE_REPO: ${{ inputs.gateway_ee_repo }}
           FIPS_REPO: ${{ inputs.gateway_fips_repo }}
+          VARIANT: ${{ inputs.variant }}
         run: |
           set -euo pipefail
+          # The native default builds the HOST arch only (no cross); the -x variant cross-builds
+          # all targets. So the default gates only the native arches (amd64/arm64); -x also gates
+          # s390x (built on the amd64 candidate via cross, Gateway run under qemu).
+          archfilter() { if [ "${VARIANT:-default}" = "x" ]; then cat; else tr ',' '\n' | grep -E '^(amd64|arm64)$' | paste -sd, -; fi; }
           entries() {  # edition  gateway  "arch,list"
             for a in $(echo "$3" | tr ',' ' '); do
               case "$a" in
                 arm64) runner=ubuntu-24.04-arm; build=arm64; qemu=false ;;
                 amd64) runner=ubuntu-latest;    build=amd64; qemu=false ;;
-                *)     runner=ubuntu-latest;    build=amd64; qemu=true  ;;  # s390x etc. via qemu
+                *)     runner=ubuntu-latest;    build=amd64; qemu=true  ;;  # s390x etc. via qemu (-x only)
               esac
               echo "{\"edition\":\"$1\",\"arch\":\"$a\",\"gateway\":\"$2:$TAG\",\"runner\":\"$runner\",\"build_arch\":\"$build\",\"qemu\":$qemu}"
             done
@@ -228,9 +234,9 @@ jobs:
           # with a non-zero exit, or pipefail+set -e fails the step for CE-only releases
           # (no EE/FIPS - e.g. v5.0.x, and the v5.3 LTS: EE starts 5.7, FIPS starts 5.8).
           {
-            entries ce "$CE_REPO" "${{ steps.r.outputs.CE_ARCHS }}"
-            if [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ];   then entries ee "$EE_REPO" "${{ steps.r.outputs.EE_ARCHS }}"; fi
-            if [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ]; then entries ee-fips "$FIPS_REPO" "${{ steps.r.outputs.FIPS_ARCHS }}"; fi
+            entries ce "$CE_REPO" "$(printf '%s' "${{ steps.r.outputs.CE_ARCHS }}" | archfilter)"
+            if [ "${{ steps.r.outputs.EE_AVAILABLE }}" = "true" ];   then entries ee "$EE_REPO" "$(printf '%s' "${{ steps.r.outputs.EE_ARCHS }}" | archfilter)"; fi
+            if [ "${{ steps.r.outputs.FIPS_AVAILABLE }}" = "true" ]; then entries ee-fips "$FIPS_REPO" "$(printf '%s' "${{ steps.r.outputs.FIPS_ARCHS }}" | archfilter)"; fi
           } | jq -sc . | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
 
   # ---- 2. Build the compiler ONCE per arch, push to GHCR by digest -----------

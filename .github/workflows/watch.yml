@@ -9,7 +9,7 @@ name: watch
 #   plan   -> resolve policy + detect drift. Outputs: which base(s) are stale, the capped
 #             oldest-first version lists to (re)build, and whether the main package exists yet.
 #   base   -> if a base is stale, call build-base.yml (workflow_call) to rebuild JUST that
-#             variant ONCE, before any release fans out. DHI and Wolfi move INDEPENDENTLY.
+#             variant ONCE, before any release fans out. busybox (native+x) and Wolfi move INDEPENDENTLY.
 #   fanout -> dispatch build.yml / build-wolfi.yml per version. They FROM the (now fresh) base,
 #             so a mass re-stack is N cheap release builds, not N base rebuilds.
 #
@@ -49,7 +49,8 @@ permissions:
 
 env:
   IMAGE_NAME: compile-tyk-plugin
-  DHI_BASE: dhi.io/debian-base:trixie-debian13-dev
+  # busybox-glibc base (free, non-FIPS). SWAP to dhi.io/busybox:1-debian-fips-dev once entitled.
+  BUSYBOX_BASE: dhi.io/busybox:1-debian-dev
   WOLFI_BASE: cgr.dev/chainguard/wolfi-base:latest
   GHCR_NS: ${{ github.repository_owner }}
 
@@ -58,10 +59,10 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      base_variant:   ${{ steps.d.outputs.base_variant }}    # space-separated subset of {dhi,slim,wolfi}, or none
-      dhi_versions:   ${{ steps.d.outputs.dhi_versions }}    # space list, capped, oldest-first
-      slim_versions:  ${{ steps.d.outputs.slim_versions }}
-      wolfi_versions: ${{ steps.d.outputs.wolfi_versions }}
+      base_variant:    ${{ steps.d.outputs.base_variant }}    # space-separated subset of {native,x,wolfi}, or none
+      native_versions: ${{ steps.d.outputs.native_versions }} # space list, capped, oldest-first
+      x_versions:      ${{ steps.d.outputs.x_versions }}
+      wolfi_versions:  ${{ steps.d.outputs.wolfi_versions }}
       main_missing:   ${{ steps.d.outputs.main_missing }}    # true | false (lone-first guard)
     steps:
       - uses: actions/checkout@v5
@@ -103,10 +104,11 @@ jobs:
           set -euo pipefail
           img="ghcr.io/${GHCR_NS}/${IMAGE_NAME}"
 
-          # Live base digests - what a base/compiler SHOULD be stacked on.
-          dhi_now="$(crane digest "${DHI_BASE}")"
+          # Live base digests - what a base/compiler SHOULD be stacked on. native + x share the
+          # busybox upstream (they differ only by the cross toolchains added on top).
+          bb_now="$(crane digest "${BUSYBOX_BASE}")"
           wolfi_now="$(crane digest "${WOLFI_BASE}")"
-          echo "live base: DHI=$dhi_now WOLFI=$wolfi_now"
+          echo "live base: BUSYBOX=$bb_now WOLFI=$wolfi_now"
 
           # Resolve releases.yml -> ACTIVE (base-CVE-current) + FROZEN (built once, kept).
           resolved="$(GW_CE_REPO="$GW_CE_REPO" SOURCE_REPO="$SOURCE_REPO" bash scripts/resolve-releases.sh)"
@@ -123,22 +125,22 @@ jobs:
             | jq -r '[.manifests[]?|select((.platform.os//"")=="linux" and (.platform.architecture//"")!="unknown")|.platform.architecture]|sort|unique|join(",")' 2>/dev/null || true; }
 
           # (A) Is the BASE LAYER itself stale? (missing, or built on an older upstream digest)
-          # slim = the DHI base + purge, so it records the DHI upstream digest too and goes stale
-          # exactly when DHI does (tracked separately so a lagged slim base build still catches up).
-          dhi_base_have="$(base_of "${img}-base:latest")"
-          slim_base_have="$(base_of "${img}-base-slim:latest")"
+          # native (-base) and x (-base-x) both record the busybox upstream digest and go stale
+          # exactly when busybox does (tracked separately so a lagged build still catches up).
+          native_base_have="$(base_of "${img}-base:latest")"
+          x_base_have="$(base_of "${img}-base-x:latest")"
           wolfi_base_have="$(base_of "${img}-base-wolfi:latest")"
-          dhi_base_stale=false; slim_base_stale=false; wolfi_base_stale=false
-          if [ "$FORCE_ALL" = "true" ] || [ "$dhi_base_have"   != "$dhi_now"   ]; then dhi_base_stale=true;   fi
-          if [ "$FORCE_ALL" = "true" ] || [ "$slim_base_have"  != "$dhi_now"   ]; then slim_base_stale=true;  fi
-          if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_base_have" != "$wolfi_now" ]; then wolfi_base_stale=true; fi
+          native_base_stale=false; x_base_stale=false; wolfi_base_stale=false
+          if [ "$FORCE_ALL" = "true" ] || [ "$native_base_have" != "$bb_now"    ]; then native_base_stale=true; fi
+          if [ "$FORCE_ALL" = "true" ] || [ "$x_base_have"      != "$bb_now"    ]; then x_base_stale=true;      fi
+          if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_base_have"  != "$wolfi_now" ]; then wolfi_base_stale=true;  fi
           bv=""
-          [ "$dhi_base_stale"   = true ] && bv="$bv dhi"
-          [ "$slim_base_stale"  = true ] && bv="$bv slim"
-          [ "$wolfi_base_stale" = true ] && bv="$bv wolfi"
+          [ "$native_base_stale" = true ] && bv="$bv native"
+          [ "$x_base_stale"      = true ] && bv="$bv x"
+          [ "$wolfi_base_stale"  = true ] && bv="$bv wolfi"
           bv="$(echo $bv | xargs || true)"; [ -n "$bv" ] || bv=none
           echo "base_variant=$bv" >> "$GITHUB_OUTPUT"
-          echo "base: DHI stale=$dhi_base_stale (on ${dhi_base_have:-<missing>}); SLIM stale=$slim_base_stale (on ${slim_base_have:-<missing>}); WOLFI stale=$wolfi_base_stale (on ${wolfi_base_have:-<missing>}) -> rebuild='$bv'"
+          echo "base: NATIVE stale=$native_base_stale (on ${native_base_have:-<missing>}); X stale=$x_base_stale (on ${x_base_have:-<missing>}); WOLFI stale=$wolfi_base_stale (on ${wolfi_base_have:-<missing>}) -> rebuild='$bv'"
 
           # (B) Which VERSIONS need a (re)build - LEVEL-triggered per version (compare each image's
           #     recorded base to live). Converges even when capped/failed: laggards catch up next run.
@@ -149,25 +151,25 @@ jobs:
           add() { cand="$cand$(printf '\n%s %s %s' "$1" "$2" "$3")"; }
           for v in $active; do
             cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
-            dhi_have="$(echo "$cfg" | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty')"
-            if [ "$FORCE_ALL" = "true" ] || [ "$dhi_have" != "$dhi_now" ]; then [ "$cfg" = '{}' ] && add 2 "$v" dhi || add 1 "$v" dhi; fi
-            slim_have="$(base_of "${img}:${v}-slim")"   # slim re-stacks on the same DHI digest as dhi
-            if [ "$FORCE_ALL" = "true" ] || [ "$slim_have" != "$dhi_now" ]; then [ -z "$slim_have" ] && add 2 "$v" slim || add 1 "$v" slim; fi
+            native_have="$(echo "$cfg" | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty')"
+            if [ "$FORCE_ALL" = "true" ] || [ "$native_have" != "$bb_now" ]; then [ "$cfg" = '{}' ] && add 2 "$v" native || add 1 "$v" native; fi
+            x_have="$(base_of "${img}:${v}-x")"   # -x re-stacks on the same busybox digest as native
+            if [ "$FORCE_ALL" = "true" ] || [ "$x_have" != "$bb_now" ]; then [ -z "$x_have" ] && add 2 "$v" x || add 1 "$v" x; fi
             wolfi_have="$(base_of "${img}:${v}-wolfi")"
             if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then [ -z "$wolfi_have" ] && add 2 "$v" wolfi || add 1 "$v" wolfi; fi
-            # edition/arch coverage drift (read from the existing DHI image) -> re-stack all variants
+            # edition/arch coverage drift (read from the existing default image) -> re-stack all variants
             [ "$cfg" = '{}' ] && continue
             for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
               ed="${spec%%:*}"; gw="${spec##*:}"
               live="$(live_archs "${gw}:${v}")"; have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
-              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; add 1 "$v" dhi; add 1 "$v" slim; add 1 "$v" wolfi; fi
+              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; add 1 "$v" native; add 1 "$v" x; add 1 "$v" wolfi; fi
             done
           done
           # FROZEN: build once if the image is missing (backfill); never re-stacked on a base change.
           for v in $frozen; do
-            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image (frozen)";   add 2 "$v" dhi; }
-            crane manifest "${img}:${v}-slim"  >/dev/null 2>&1 || { echo "-> $v: no slim image (frozen)";  add 2 "$v" slim; }
-            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)"; add 2 "$v" wolfi; }
+            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no native image (frozen)"; add 2 "$v" native; }
+            crane manifest "${img}:${v}-x"     >/dev/null 2>&1 || { echo "-> $v: no -x image (frozen)";     add 2 "$v" x; }
+            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)";  add 2 "$v" wolfi; }
           done
 
           # Order: re-stacks (tier 1) before backfills (tier 2), oldest-first within each tier.
@@ -180,13 +182,13 @@ jobs:
           else
             echo "cap: none (uncapped) - dispatching all $(printf '%s\n' "$ranked" | grep -c .) needed builds"
           fi
-          dhi_uniq="$(printf '%s\n' "$ranked"   | awk '$3=="dhi"{print $2}')"
-          slim_uniq="$(printf '%s\n' "$ranked"  | awk '$3=="slim"{print $2}')"
-          wolfi_uniq="$(printf '%s\n' "$ranked" | awk '$3=="wolfi"{print $2}')"
-          echo "dhi_versions=$(echo $dhi_uniq)"     >> "$GITHUB_OUTPUT"
-          echo "slim_versions=$(echo $slim_uniq)"   >> "$GITHUB_OUTPUT"
-          echo "wolfi_versions=$(echo $wolfi_uniq)" >> "$GITHUB_OUTPUT"
-          echo "to build: DHI=[$(echo $dhi_uniq)] SLIM=[$(echo $slim_uniq)] WOLFI=[$(echo $wolfi_uniq)]"
+          native_uniq="$(printf '%s\n' "$ranked" | awk '$3=="native"{print $2}')"
+          x_uniq="$(printf '%s\n' "$ranked"      | awk '$3=="x"{print $2}')"
+          wolfi_uniq="$(printf '%s\n' "$ranked"  | awk '$3=="wolfi"{print $2}')"
+          echo "native_versions=$(echo $native_uniq)" >> "$GITHUB_OUTPUT"
+          echo "x_versions=$(echo $x_uniq)"           >> "$GITHUB_OUTPUT"
+          echo "wolfi_versions=$(echo $wolfi_uniq)"   >> "$GITHUB_OUTPUT"
+          echo "to build: NATIVE=[$(echo $native_uniq)] X=[$(echo $x_uniq)] WOLFI=[$(echo $wolfi_uniq)]"
 
           # (C) Does the main package exist yet? If not, fan-out must seed ONE build first so the
           #     package is created+linked serially (else N concurrent first-pushes race on creation).
@@ -221,32 +223,32 @@ jobs:
           MAIN_MISSING: ${{ needs.plan.outputs.main_missing }}
           BASE_VARIANT: ${{ needs.plan.outputs.base_variant }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
-          DHI_V: ${{ needs.plan.outputs.dhi_versions }}
-          SLIM_V: ${{ needs.plan.outputs.slim_versions }}
+          NATIVE_V: ${{ needs.plan.outputs.native_versions }}
+          X_V: ${{ needs.plan.outputs.x_versions }}
           WOLFI_V: ${{ needs.plan.outputs.wolfi_versions }}
         run: |
           set -euo pipefail
-          dhi="${DHI_V}"; slim="${SLIM_V}"; wolfi="${WOLFI_V}"
+          native="${NATIVE_V}"; x="${X_V}"; wolfi="${WOLFI_V}"
           if [ "$DRY_RUN" = "true" ]; then
             echo "DRY RUN - nothing built or dispatched."
             echo "  stale base to rebuild : ${BASE_VARIANT}"
             echo "  main package missing  : ${MAIN_MISSING}"
-            echo "  would dispatch DHI    : ${dhi:-<none>}"
-            echo "  would dispatch Slim   : ${slim:-<none>}"
+            echo "  would dispatch native : ${native:-<none>}"
+            echo "  would dispatch -x     : ${x:-<none>}"
             echo "  would dispatch Wolfi  : ${wolfi:-<none>}"
             exit 0
           fi
-          if [ -z "${dhi}${slim}${wolfi}" ]; then echo "nothing to build"; exit 0; fi
+          if [ -z "${native}${x}${wolfi}" ]; then echo "nothing to build"; exit 0; fi
           if [ "$MAIN_MISSING" = "true" ]; then
-            first="$(printf '%s\n%s\n%s\n' $dhi $slim $wolfi | grep -E '^v' | sort -uV | head -n1 || true)"
+            first="$(printf '%s\n%s\n%s\n' $native $x $wolfi | grep -E '^v' | sort -uV | head -n1 || true)"
             echo "FIRST SEED: compile-tyk-plugin package absent - dispatching ONE build (${first:-none}) to create+link it serially; the rest fan out next run (no creation race)."
             if [ -n "$first" ]; then gh workflow run build.yml -f gateway_version="$first" -f push=true || echo "WARN: dispatch failed $first"; fi
             exit 0
           fi
           ok=0; fail=0
-          for v in $dhi;   do echo "dispatch DHI $v";   if gh workflow run build.yml       -f gateway_version="$v" -f push=true;                   then ok=$((ok+1)); else echo "WARN: dhi dispatch failed $v";   fail=$((fail+1)); fi; done
-          for v in $slim;  do echo "dispatch Slim $v";  if gh workflow run build.yml       -f gateway_version="$v" -f variant=slim -f push=true;   then ok=$((ok+1)); else echo "WARN: slim dispatch failed $v";  fail=$((fail+1)); fi; done
-          for v in $wolfi; do echo "dispatch Wolfi $v"; if gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true;                   then ok=$((ok+1)); else echo "WARN: wolfi dispatch failed $v"; fail=$((fail+1)); fi; done
+          for v in $native; do echo "dispatch native $v"; if gh workflow run build.yml       -f gateway_version="$v" -f push=true;             then ok=$((ok+1)); else echo "WARN: native dispatch failed $v"; fail=$((fail+1)); fi; done
+          for v in $x;      do echo "dispatch -x $v";     if gh workflow run build.yml       -f gateway_version="$v" -f variant=x -f push=true; then ok=$((ok+1)); else echo "WARN: -x dispatch failed $v";     fail=$((fail+1)); fi; done
+          for v in $wolfi;  do echo "dispatch Wolfi $v";  if gh workflow run build-wolfi.yml -f gateway_version="$v" -f push=true;              then ok=$((ok+1)); else echo "WARN: wolfi dispatch failed $v";  fail=$((fail+1)); fi; done
           echo "dispatched ok=$ok failed=$fail"
           # per-item resilience (one bad dispatch never blocks the rest), but a TOTAL failure
           # (e.g. wrong repo/permissions) must fail loudly, not look like a successful no-op.

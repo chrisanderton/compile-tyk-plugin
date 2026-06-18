@@ -1,35 +1,56 @@
 # Base images
 
 The compiler is published in three variants. They produce identical plugins; you choose the
-one that fits your supply-chain requirements.
+one that fits your build needs and supply-chain requirements.
 
-| Variant | Tag | Base | Architectures | Best for |
+| Variant | Tag | Base | Builds for | Best for |
 |---|---|---|---|---|
-| Docker Hardened Image (default) | `:vX.Y.Z` | `dhi.io/debian-base` (dev) | amd64, arm64, s390x | Most users; signed, SBOM-backed supply chain |
-| Slim (trimmed DHI) | `:vX.Y.Z-slim` | same DHI base, unused packages purged | amd64, arm64, s390x | Lowest-CVE option that still cross-compiles |
-| Wolfi | `:vX.Y.Z-wolfi` | `cgr.dev/chainguard/wolfi-base` | amd64, arm64 | Teams standardized on Chainguard |
+| Default (native) | `:vX.Y.Z` | DHI busybox-glibc | its own host arch (amd64->amd64, arm64->arm64) | Most users; native amd64/arm64 builds |
+| Cross | `:vX.Y.Z-x` | DHI busybox-glibc + cross toolchains | amd64, arm64, s390x (cross) | When you need cross-compilation or s390x |
+| Wolfi | `:vX.Y.Z-wolfi` | `cgr.dev/chainguard/wolfi-base` | its own host arch (amd64/arm64) | Lowest CVE count; teams standardized on Chainguard |
 
 All three bases are glibc, which is what matters for compiling CGO Go plugins that load into
 the glibc-based Gateway runtime.
 
-## Default: Docker Hardened Image
+## Default: busybox-glibc, native-only
 
-The Gateway itself runs on a Docker Hardened Image (DHI) runtime base. The compiler uses
-the **dev variant** of the same DHI family (`debian-base`): same hardened, continuously
-patched Debian lineage, but with the shell, package manager, and build tools the compiler
-needs. The runtime variant strips those out and cannot compile.
+The default `:vX.Y.Z` tag is built on a Docker Hardened Image **busybox-glibc** base: a
+hardened, minimal, continuously patched glibc base carrying just the build-time toolchain the
+compiler needs (Go, gcc, binutils, the glibc-2.17 link sysroot, scripts). It is **native-only**:
+it builds for its own host architecture (amd64->amd64, arm64->arm64) and does not cross-compile.
+It is published amd64 + arm64, so Docker pulls the native image for your host.
 
-Using the same hardened base across build and runtime gives you one libc story and
-consistent attestations: the compiler inherits DHI's signed images, SBOMs, SLSA build
-provenance, and continuous patching, with VEX and FIPS/STIG variants available on the
-Select and Enterprise tiers.
+Native is the preferred path for CGO-heavy plugins. Reach for the `-x` variant only when you
+need a different target arch or s390x.
 
-The DHI base requires authentication (free tier):
+The base inherits DHI's hardening: signed images, SBOMs, SLSA build provenance, and continuous
+patching. The base ships an unused-package purge (perl/gpgv/ncurses removed and the distroless
+scanner manifest reconciled) so the scan reflects what is actually present.
+
+You pull the published compiler from Docker Hub / GHCR like any image - the DHI base layers are
+republished into it, so **no `dhi.io` login is needed to use it**:
 
 ```bash
-docker login dhi.io          # use your Docker Hub credentials
 docker pull <you>/compile-tyk-plugin:vX.Y.Z
 ```
+
+(Only maintainers rebuilding the base need `docker login dhi.io` - with their Docker Hub
+credentials, free tier - to pull the upstream DHI base.)
+
+## Cross variant: `-x`
+
+The `-x` tag is the **same busybox-glibc base plus C cross toolchains** for the plugin target
+architectures. It cross-compiles to **amd64 / arm64 / s390x** regardless of host, and supports
+all three editions:
+
+```bash
+docker run --rm -e GOARCH=s390x -v "$PWD:/plugin-source" \
+  <you>/compile-tyk-plugin:vX.Y.Z-x my-plugin.so
+```
+
+The cross toolchains are the only difference from the default; they add some low-severity
+scanner findings (the cross-target binutils BFD-parser advisories) but no new
+CRITICALs/HIGHs. See [`security-note.md`](security-note.md) for the measured numbers.
 
 ## Wolfi variant
 
@@ -45,13 +66,10 @@ very clean. The trade-offs:
 All three editions (CE, EE, EE-FIPS) are supported on the Wolfi variant for amd64 and
 arm64.
 
-## Slim variant (trimmed DHI)
+## Package trimming on the busybox-glibc base
 
-The `-slim` tag is the **same DHI base and the same cross toolchains as the default**
-`:vX.Y.Z` - it still cross-compiles amd64/arm64/s390x and supports all three editions. It
-only has the packages the compiler never uses at runtime removed, to lower the CVE scan.
-
-How it is built (`SLIM=1` in `Dockerfile.base`):
+Both busybox-glibc variants (default and `-x`) have the packages the compiler never uses at
+runtime removed, to keep the scan honest and low:
 
 - **Purge unused packages, files and all.** `perl`, `perl-base`, `perl-modules`, `gpgv`,
   `ncurses-base/bin/term`, and the orphaned `libperl` runtime (perl's shared library; its only
@@ -59,7 +77,7 @@ How it is built (`SLIM=1` in `Dockerfile.base`):
   files - not just a manifest entry.
 - **No curl.** Go is fetched at build time via BuildKit `ADD` + `sha256sum` verification, so the
   image needs no `curl` CLI (the trust anchor - go.dev plus the pinned checksum - is unchanged).
-- **Reconcile the scanner manifest.** DHI tracks packages in a distroless
+- **Reconcile the scanner manifest.** The base tracks packages in a distroless
   `/var/lib/dpkg/status.d/` manifest (one file per package) that `apt`/`dpkg` do not update. We
   clear those entries **only for packages we actually removed** - never for one whose files
   remain. Nothing is suppressed or VEX'd; everything still present stays reported.
@@ -67,43 +85,16 @@ How it is built (`SLIM=1` in `Dockerfile.base`):
 What stays, and why (load-bearing - removing it would break the build or hide a real package):
 
 - `linux-libc-dev` - native CGO's `<errno.h>` includes `<linux/errno.h>`, so removing it breaks
-  native compilation (and the boringcrypto FIPS path). Cross builds use the 2.17 sysroot's own
-  kernel headers. Its findings are kernel-header CVEs (no kernel runs in a build image) but we
-  keep the package and leave them honestly reported.
+  native compilation (and the boringcrypto FIPS path). On the `-x` variant, cross builds use the
+  2.17 sysroot's own kernel headers. Its findings are kernel-header CVEs (no kernel runs in a
+  build image) but we keep the package and leave them honestly reported.
 - `libtinfo6` (bash); `libexpat1`/`libcurl`/`libssh2` (git's HTTPS/VCS transport, used to fetch
   plugin modules); `libsqlite3`/`libssl3`/`openssl` (PAM, apt, coreutils, ca-certificates); and
   the Go `stdlib` (tracks the Gateway's Go version).
 
-Measured, arm64, raw Trivy (no VEX): the default DHI image scans **9 CRITICAL / 77 HIGH**; the
-`-slim` image scans **1 CRITICAL / 58 HIGH**. The one remaining critical is `linux-libc-dev`.
-
-### Why not a more minimal base (e.g. busybox)?
-
-A reasonable suggestion is to rebuild the compiler on a busybox/distroless base, the way the
-Gateway image is. We measured it and chose the slim-purge of the DHI base instead:
-
-- **The compiler is a build environment, not a runtime image.** The Gateway's minimal image
-  (`ci/Dockerfile.distroless` in `TykTechnologies/tyk`) builds the gateway `.deb` on Debian, then
-  `COPY`s the single finished `tyk` binary onto a minimal base - nothing is installed on that
-  base. That works because the gateway is one self-contained binary. The compiler's payload is the
-  whole toolchain (Go + gcc + three cross-gccs + sysroots), which has to be present and runnable
-  in the image because you run the compile *inside* it. A busybox base has no package manager and
-  no compiler, so adopting it would mean hand-`COPY`ing the entire gcc + cross-gcc shared-library
-  closure into it - a large, fragile maintenance surface.
-- **It would not beat the existing Wolfi variant.** The DHI scan count is dominated by `binutils`
-  (540 findings across its 10 sub-packages) and `linux-libc-dev` kernel headers (353) plus glibc -
-  all intrinsic to a *cross*-compiler, so they ride along on any base. A busybox image carrying the
-  same Debian cross toolchain would still report ~900. Wolfi reaches a near-zero OS count only
-  because it is
-  **native-only** (no cross binutils) and Chainguard-patched - which is exactly what `-wolfi`
-  already offers for teams that don't need cross/s390x.
-- **The criticals were never in the toolchain.** On the DHI baseline, all 9 criticals and most
-  highs were in droppable packages (perl alone was 8 of the 9 criticals; the rest curl, sqlite,
-  expat, ncurses). A purge clears those with no base swap and no toolchain risk.
-- **The real blocker to a lower scan was the scanner manifest, not the base.** DHI bakes the
-  distroless `status.d` manifest (and an SBOM under `/opt/docker/sbom`) that `apt`/`dpkg` do not
-  update, so scanners keep reporting packages you have already removed. Reconciling the manifest -
-  not changing the base - is what makes the reduction real.
+The full measured CVE picture for every variant is in [`security-note.md`](security-note.md).
+The short version: under Trivy `--ignore-unfixed` all variants collapse to the same ~27
+findings (the shared Go stdlib), so the *actionable* surface is identical across them.
 
 ## The glibc floor is the same across all variants
 
@@ -112,7 +103,7 @@ CentOS 7 ABI, from `manylinux2014`) baked into the image, independent of the bas
 glibc. This keeps the plugin's required glibc symbols low - loadable on the Gateway runtime
 *and* on older native hosts like RHEL 7 - regardless of which base produced it. See
 [`compatibility.md`](compatibility.md) for measured ceilings,
-[`glibc-targets.md`](glibc-targets.md) for the rare higher-floor opt-in, and
+[`glibc-targets.md`](glibc-targets.md) for the optional custom-floor mechanism, and
 [`../data/sysroot-2.17-digests.txt`](../data/sysroot-2.17-digests.txt) for the pinned
 2.17 sources and the arches they cover.
 
@@ -123,7 +114,7 @@ uses `apt` or `apk`, so you can point it at another glibc base:
 
 ```bash
 docker build -f Dockerfile.base \
-  --build-arg BASE_IMAGE=<your-namespace>/dhi-debian-base:13-dev \
+  --build-arg BASE_IMAGE=<your-namespace>/dhi-busybox-glibc:dev \
   -t compile-tyk-plugin-base:custom .
 ```
 
@@ -136,17 +127,20 @@ Notes:
 
 ## CVE posture
 
-On a raw Trivy scan (no VEX), the **default** DHI image and a well-trimmed
-`debian:trixie-slim` land in a similar place, because both are Debian 13 / glibc. DHI's
-value over plain trixie is the supply chain around it, not the raw count: signed images,
-SBOM and SLSA provenance, VEX attestations (Select/Enterprise), and a support SLA.
+On a raw full Trivy scan, the busybox-glibc **default** carries ~1 CRITICAL / ~49 HIGH / ~1000
+total. The lone CRITICAL is `linux-libc-dev` (a Linux kernel CVE attributed to the kernel-UAPI
+headers package - no kernel runs in a build image; it is `#include`-only, kept and honestly
+reported). The **`-x`** variant adds the cross toolchains: ~the same criticals/highs and ~1100
+total, where the extra ~100 are all LOW (cross-target binutils BFD-parser advisories). The
+**`-wolfi`** variant is native-only: 0 CRITICAL / 9 HIGH / 27 total, all of it the shared Go
+stdlib.
 
-The **`-slim`** variant trims the unused packages from that same DHI base - including the
-perl family, which is removable with `apt-get purge --allow-remove-essential` despite being
-`Priority: required` - for a much lower raw count while keeping cross-compilation (measured:
-9 CRITICAL / 77 HIGH -> 1 CRITICAL / 58 HIGH on arm64). The **`-wolfi`** variant is
-native-only with a near-zero count. See the "Slim variant" section above and
-`docs/security-note.md` for the full comparison.
+The framing that matters: under Trivy `--ignore-unfixed` (dropping advisories with no fix
+available - the won't-fix kernel-header and binutils noise), **all variants collapse to the same
+~27 findings - the Go stdlib**. The actionable/fixable surface is identical across variants; the
+large raw counts on the busybox-glibc variants are almost entirely unfixed distro noise that is
+benign in a build-time image (no kernel, no runtime services). See `docs/security-note.md` for the
+full comparison.
 
 Reference: [DHI image types](https://docs.docker.com/dhi/about/available/),
 [glibc and musl in DHI](https://docs.docker.com/dhi/core-concepts/glibc-musl/),

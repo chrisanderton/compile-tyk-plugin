@@ -21,7 +21,7 @@ release-specific parts are cheap to rebuild:
 
 ```
 compile-tyk-plugin-base:latest               # slow cadence - built ONCE by build-base.yml
-  base OS + gcc and cross toolchains + glibc sysroots (2.17 default) + build.sh + validator
+  busybox-glibc base + gcc (+ cross toolchains on -x) + glibc sysroots (2.17 default) + build.sh + validator
 
 compile-tyk-plugin:vX.Y.Z                    # per release, cheap - build.yml FROMs the base
   FROM compile-tyk-plugin-base@<digest>
@@ -45,9 +45,17 @@ This split is the central structural choice. It means:
 
 ## Everything release-specific is a build arg
 
-No Dockerfile edits are needed per release. The release layer takes:
-`GO_VERSION`, `GITHUB_SHA`, `GITHUB_TAG`, `BUILD_TAG`, `GOFIPS140`, `BASE_IMAGE`,
-`GLIBC_TARGET`, `WITH_CXX`, `WITH_GIT`, `WITH_GATEWAY_SELFTEST`.
+No Dockerfile edits are needed per release. The base layer takes (among others):
+`GLIBC_TARGET`, `CROSS`, `SLIM`, `WITH_CXX`, `WITH_GIT`; the release layer takes `GO_VERSION`,
+`GITHUB_SHA`, `GITHUB_TAG`, `BUILD_TAG`, `GOFIPS140`, `BASE_IMAGE`, `WITH_GATEWAY_SELFTEST`.
+
+`CROSS` selects the two busybox-glibc shapes from one Dockerfile: the default tag is `CROSS=0`
+(native-only, native gcc only - `build.sh` builds the host arch and fails fast on a cross target,
+the same native-only path Wolfi uses), the `-x` tag is `CROSS=1` (adds the amd64/arm64/s390x
+cross gccs). The unused-package purge is **always applied** on the busybox-glibc base via
+`SLIM`, which **defaults to `1`**; a `SLIM=0` value is retained only as an **exit ramp** if a
+future base bump ever makes the purge unsafe (base-drift safety) - it is not a shipped variant.
+The Wolfi (apk) base has no dpkg and skips the purge regardless.
 
 The Go version is not hardcoded. `scripts/resolve-gateway.sh` reads it directly from the
 published Gateway binary (`go version -m`) and fetches the matching checksums from
@@ -137,12 +145,12 @@ customer-facing tag/retention contract are in [`SUPPORT.md`](../SUPPORT.md).
 | Trigger | What rebuilds | Tag |
 |---|---|---|
 | New Gateway release | release layer (Go version + source auto-derived) | moving `:vX.Y.Z` + `:vX.Y.Z-YYYYMMDD` |
-| Base CVE update, no Gateway change | base layer only, re-stack the ACTIVE set (DHI/Wolfi independent) | `:vX.Y.Z` refreshed + new `:vX.Y.Z-YYYYMMDD` |
+| Base CVE update, no Gateway change | base layer only, re-stack the ACTIVE set (busybox-glibc/Wolfi independent) | `:vX.Y.Z` refreshed + new `:vX.Y.Z-YYYYMMDD` |
 | Toolchain / sysroot / glibc-target change | base layer | new base + re-stack ACTIVE |
 | Go bump within a release line | follows the Gateway automatically | unchanged |
 
-The moving `:vX.Y.Z` (and `:vX.Y.Z-wolfi`) always points at the latest-patched build - track it
-for currency. The dated `:vX.Y.Z-YYYYMMDD` snapshots are immutable pins, retained for
+The moving `:vX.Y.Z` (and `:vX.Y.Z-x`, `:vX.Y.Z-wolfi`) always points at the latest-patched build -
+track it for currency. The dated `:vX.Y.Z-YYYYMMDD` snapshots are immutable pins, retained for
 `snapshot_retention_days` (default 14) on actively-updated versions. See `SUPPORT.md`.
 
 ## How the repository implements it
@@ -153,16 +161,16 @@ under your namespace. The external contract is a single input: the Gateway versi
 | File | Role |
 |---|---|
 | `scripts/resolve-gateway.sh` | Input `vX.Y.Z`. Reads the published Gateway image and emits `GITHUB_SHA`, the exact `GO_VERSION`, Go checksums, and per-edition settings. |
-| `Dockerfile.base` | Stable layer: base OS, toolchains, glibc sysroots (2.17 default), scripts. No Go or source. Records the base digest it was built from (label `io.ctp.dhi-base-digest`). |
+| `Dockerfile.base` | Stable layer: busybox-glibc base, toolchains, glibc sysroots (2.17 default), scripts. No Go or source. `CROSS` (default 0) selects native vs `-x` cross shape; `SLIM` (default 1) applies the unused-package purge, with `SLIM=0` retained only as a base-drift exit ramp. Records the base digest it was built from (label `io.ctp.dhi-base-digest`). |
 | `Dockerfile.release` | `FROM` base, plus the exact Go and the vendored Gateway source. Built per release. |
-| `.github/workflows/build-base.yml` | Builds the stable base layer(s) **once**, independently of any Gateway version: `compile-tyk-plugin-base:latest` (DHI) and/or `-base-wolfi:latest` (Wolfi), pinned by upstream digest, with the `io.ctp.dhi-base-digest` label. DHI and Wolfi are separate matrix legs (separate packages), so first-creation is serial - no concurrent-creation race. Run it before the first build / after a base CVE; `watch.yml` calls it (`workflow_call`) before fanning out. |
-| `.github/workflows/build.yml` | `resolve -> build-candidate -> gate -> publish`. `resolve` **pins** the prebuilt `-base:latest` by digest (fails fast if it is missing); no base is built here. The compiler image is edition-agnostic, so it is built ONCE per arch (native amd64/arm64 runners, no QEMU) and pushed to GHCR by digest. The gate then pulls that image and loads a real plugin into the matching Gateway for every edition/arch. Publish stitches the two gated per-arch images into one multi-arch manifest (`imagetools create`, no rebuild) and tags it in GHCR + Docker Hub, so you publish the exact images the gate proved. Publish is blocked unless every gate passes. |
+| `.github/workflows/build-base.yml` | Builds the stable base layer(s) **once**, independently of any Gateway version: `compile-tyk-plugin-base:latest` (busybox-glibc native), `-base-x:latest` (busybox-glibc + cross toolchains) and/or `-base-wolfi:latest` (Wolfi), pinned by upstream digest, with the `io.ctp.dhi-base-digest` label. Each is a separate matrix leg (separate package), so first-creation is serial - no concurrent-creation race. Run it before the first build / after a base CVE; `watch.yml` calls it (`workflow_call`) before fanning out. |
+| `.github/workflows/build.yml` | `resolve -> build-candidate -> gate -> publish`. A `variant` input selects default (`-base:latest`, native-only) or `x` (`-base-x:latest`, cross). `resolve` **pins** the chosen prebuilt base by digest (fails fast if it is missing); no base is built here. The compiler image is edition-agnostic, so it is built ONCE per arch and pushed to GHCR by digest - the native default builds the host arch only (amd64/arm64 runners, no QEMU), while `-x` cross-builds all targets (s390x via QEMU). The gate then pulls that image and loads a real plugin into the matching Gateway for every edition/arch. Publish stitches the gated per-arch images into one multi-arch manifest (`imagetools create`, no rebuild) and tags it (`:vX.Y.Z` or `:vX.Y.Z-x`) in GHCR + Docker Hub, so you publish the exact images the gate proved. Publish is blocked unless every gate passes. |
 | `scripts/loadtest-gate.sh` | The gate logic: build a plugin, then verify it loads via the Gateway's own `tyk plugin load -s <symbol>` ABI check. Reusable standalone. |
 | `.github/workflows/build-wolfi.yml` | Wolfi variant: same resolver, pins the prebuilt `-base-wolfi:latest`, native amd64/arm64 only, publishes `:vX.Y.Z-wolfi`. |
 | `releases.yml` | **The support policy - single source of truth.** Declares `maintained` (whole minor lines), `maintained_extra` (exact one-off versions), `retired` (lines -> keep tip / versions -> keep that one), plus `patch_depth` and `snapshot_retention_days`. Editing it via PR is how you change what is built and kept. See `SUPPORT.md`. |
 | `scripts/resolve-releases.sh` | Resolves `releases.yml` against buildable Gateway versions (git tag AND published image) into `ACTIVE` (base-CVE-updated) + `FROZEN` (built once, kept) sets. Shared by `watch.yml` and `prune.yml` so they cannot drift. |
-| `.github/workflows/watch.yml` | Daily cron, three jobs: **plan -> base -> fanout**. `plan` reads the resolver and decides which base(s) are stale and which versions need a (re)build; `base` calls `build-base.yml` (`workflow_call`) to rebuild **only** the stale variant **once**, before any release fans out; `fanout` dispatches `build.yml` / `build-wolfi.yml` per version, which `FROM` the now-fresh base. It **builds** any kept version (ACTIVE or FROZEN) missing an image - new releases plus the one-time backfill of older patches (capped by `max_dispatch`, default 12/run, **oldest first** so the riskiest old-toolchain builds and the slow base warm-up happen first); **rebuilds** on edition/arch drift (ACTIVE only); **re-stacks** any ACTIVE version **not on the live base** - level-triggered per version (compares each image's recorded `io.ctp.dhi-base-digest` to live), so a capped or failed run just catches up next run rather than going silently stale. DHI and Wolfi bases move **independently**. On a from-empty seed, fanout dispatches **one** build first (lone-first guard) so the `compile-tyk-plugin` package is created+linked serially before the rest fan out. Buildable versions are proper-semver git tags that also have a published gateway image. Manual `build.yml` dispatch still allows any version, including release candidates. |
-| `.github/workflows/prune.yml` | Weekly cron; **enforces** `releases.yml` on the registry. Keeps exactly ACTIVE + FROZEN: moving `:vX.Y.Z[-wolfi]` always; ACTIVE dated snapshots within `snapshot_retention_days`; FROZEN keep only their latest snapshot; deletes out-of-policy versions. Applies by default - run once with `dry_run=true` to preview. Safe to automate because it applies a reviewed file, not an inference. |
+| `.github/workflows/watch.yml` | Daily cron, three jobs: **plan -> base -> fanout**. `plan` reads the resolver and decides which base(s) are stale and which versions need a (re)build; `base` calls `build-base.yml` (`workflow_call`) to rebuild **only** the stale variant **once**, before any release fans out; `fanout` dispatches `build.yml` / `build-wolfi.yml` per version, which `FROM` the now-fresh base. It **builds** any kept version (ACTIVE or FROZEN) missing an image - new releases plus the one-time backfill of older patches (capped by `max_dispatch`, default 12/run, **oldest first** so the riskiest old-toolchain builds and the slow base warm-up happen first); **rebuilds** on edition/arch drift (ACTIVE only); **re-stacks** any ACTIVE version **not on the live base** - level-triggered per version (compares each image's recorded `io.ctp.dhi-base-digest` to live), so a capped or failed run just catches up next run rather than going silently stale. The busybox-glibc, `-x` and Wolfi bases move **independently**. On a from-empty seed, fanout dispatches **one** build first (lone-first guard) so the `compile-tyk-plugin` package is created+linked serially before the rest fan out. Buildable versions are proper-semver git tags that also have a published gateway image. Manual `build.yml` dispatch still allows any version, including release candidates. |
+| `.github/workflows/prune.yml` | Weekly cron; **enforces** `releases.yml` on the registry. Keeps exactly ACTIVE + FROZEN: moving `:vX.Y.Z[-x][-wolfi]` always; ACTIVE dated snapshots within `snapshot_retention_days`; FROZEN keep only their latest snapshot; deletes out-of-policy versions. Applies by default - run once with `dry_run=true` to preview. Safe to automate because it applies a reviewed file, not an inference. |
 
 ## CI credentials
 

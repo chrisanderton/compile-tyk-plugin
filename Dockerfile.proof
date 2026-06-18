@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Lean PROOF image: validates the modern base (cross toolchains + glibc sysroots + build.sh
+# Lean PROOF image: validates the modern base (toolchains + glibc sysroots + build.sh
 # + validator) WITHOUT the heavy Gateway vendoring. It is literally the production BASE image
 # plus a Go toolchain - so it exercises the EXACT sysroots/toolchain the real compiler uses,
 # with NO second, drift-prone sysroot definition. The glibc floor is whatever the base was
@@ -11,7 +11,7 @@
 #                -t tyk-plugin-compiler:proof .
 #   ./scripts/validate-proof.sh
 ARG COMPILER_BASE_IMAGE=compile-tyk-plugin-base:proof
-ARG BASE_IMAGE=dhi.io/debian-base:trixie-debian13-dev
+ARG BASE_IMAGE=dhi.io/busybox:1-debian-dev
 ARG GO_VERSION=1.25.10
 
 # ---- pinned Go toolchain (the only thing the base deliberately omits) ------
