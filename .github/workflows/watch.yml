@@ -32,10 +32,10 @@ on:
         type: boolean
         default: false
       max_dispatch:
-        description: "Cap release builds dispatched per run (throttles the first-run backfill; raise for faster catch-up)"
+        description: "Manual-only cap on builds dispatched THIS run (TOTAL across variants; re-stacks are picked before backfill). Empty = no cap. Scheduled runs are always uncapped."
         required: false
         type: string
-        default: "12"
+        default: ""
       dry_run:
         description: "Plan only - log what would be (re)built and dispatched; build no base and dispatch nothing"
         required: false
@@ -96,7 +96,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_ALL: ${{ inputs.force_all || 'false' }}
-          MAX_DISPATCH: ${{ inputs.max_dispatch || '12' }}
+          MAX_DISPATCH: ${{ inputs.max_dispatch }}
           SOURCE_REPO: TykTechnologies/tyk
           GW_CE_REPO: tykio/tyk-gateway
         run: |
@@ -142,34 +142,47 @@ jobs:
 
           # (B) Which VERSIONS need a (re)build - LEVEL-triggered per version (compare each image's
           #     recorded base to live). Converges even when capped/failed: laggards catch up next run.
-          need_dhi=""; need_slim=""; need_wolfi=""
+          #     Each candidate is tagged "tier version variant": tier 1 = RE-STACK (the image exists
+          #     but is on a stale base - a served-stale image to make current), tier 2 = BACKFILL
+          #     (the image is missing - first build). Used only to order a capped (manual) run.
+          cand=""
+          add() { cand="$cand$(printf '\n%s %s %s' "$1" "$2" "$3")"; }
           for v in $active; do
             cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
             dhi_have="$(echo "$cfg" | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty')"
-            if [ "$FORCE_ALL" = "true" ] || [ "$dhi_have" != "$dhi_now" ]; then need_dhi="$need_dhi $v"; fi
+            if [ "$FORCE_ALL" = "true" ] || [ "$dhi_have" != "$dhi_now" ]; then [ "$cfg" = '{}' ] && add 2 "$v" dhi || add 1 "$v" dhi; fi
             slim_have="$(base_of "${img}:${v}-slim")"   # slim re-stacks on the same DHI digest as dhi
-            if [ "$FORCE_ALL" = "true" ] || [ "$slim_have" != "$dhi_now" ]; then need_slim="$need_slim $v"; fi
+            if [ "$FORCE_ALL" = "true" ] || [ "$slim_have" != "$dhi_now" ]; then [ -z "$slim_have" ] && add 2 "$v" slim || add 1 "$v" slim; fi
             wolfi_have="$(base_of "${img}:${v}-wolfi")"
-            if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then need_wolfi="$need_wolfi $v"; fi
-            # edition/arch coverage drift (read from the existing DHI image) -> rebuild all variants
+            if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then [ -z "$wolfi_have" ] && add 2 "$v" wolfi || add 1 "$v" wolfi; fi
+            # edition/arch coverage drift (read from the existing DHI image) -> re-stack all variants
             [ "$cfg" = '{}' ] && continue
             for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
               ed="${spec%%:*}"; gw="${spec##*:}"
               live="$(live_archs "${gw}:${v}")"; have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
-              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; need_dhi="$need_dhi $v"; need_slim="$need_slim $v"; need_wolfi="$need_wolfi $v"; fi
+              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; add 1 "$v" dhi; add 1 "$v" slim; add 1 "$v" wolfi; fi
             done
           done
-          # FROZEN: build once if the image is missing; never re-stacked on a base change.
+          # FROZEN: build once if the image is missing (backfill); never re-stacked on a base change.
           for v in $frozen; do
-            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image (frozen)";   need_dhi="$need_dhi $v"; }
-            crane manifest "${img}:${v}-slim"  >/dev/null 2>&1 || { echo "-> $v: no slim image (frozen)";  need_slim="$need_slim $v"; }
-            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)"; need_wolfi="$need_wolfi $v"; }
+            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no DHI image (frozen)";   add 2 "$v" dhi; }
+            crane manifest "${img}:${v}-slim"  >/dev/null 2>&1 || { echo "-> $v: no slim image (frozen)";  add 2 "$v" slim; }
+            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)"; add 2 "$v" wolfi; }
           done
 
-          # dedupe + OLDEST FIRST (sort -V) + cap (MAX_DISPATCH spreads a big backfill over days).
-          dhi_uniq="$(echo $need_dhi     | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
-          slim_uniq="$(echo $need_slim   | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
-          wolfi_uniq="$(echo $need_wolfi | tr ' ' '\n' | grep -E '^v' | sort -uV | head -n "${MAX_DISPATCH}" || true)"
+          # Order: re-stacks (tier 1) before backfills (tier 2), oldest-first within each tier.
+          # The cap is MANUAL-ONLY and a GLOBAL TOTAL: applied only when a positive max_dispatch was
+          # supplied. Scheduled runs (and manual runs with no value) dispatch everything needed.
+          ranked="$(printf '%s\n' "$cand" | grep -E '^[12] v' | sort -u | sort -k1,1n -k2,2V)"
+          if printf '%s' "${MAX_DISPATCH:-}" | grep -qE '^[1-9][0-9]*$'; then
+            ranked="$(printf '%s\n' "$ranked" | head -n "$MAX_DISPATCH")"
+            echo "cap: $MAX_DISPATCH total (manual) - re-stacks first, then backfill"
+          else
+            echo "cap: none (uncapped) - dispatching all $(printf '%s\n' "$ranked" | grep -c .) needed builds"
+          fi
+          dhi_uniq="$(printf '%s\n' "$ranked"   | awk '$3=="dhi"{print $2}')"
+          slim_uniq="$(printf '%s\n' "$ranked"  | awk '$3=="slim"{print $2}')"
+          wolfi_uniq="$(printf '%s\n' "$ranked" | awk '$3=="wolfi"{print $2}')"
           echo "dhi_versions=$(echo $dhi_uniq)"     >> "$GITHUB_OUTPUT"
           echo "slim_versions=$(echo $slim_uniq)"   >> "$GITHUB_OUTPUT"
           echo "wolfi_versions=$(echo $wolfi_uniq)" >> "$GITHUB_OUTPUT"
