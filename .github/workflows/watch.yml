@@ -105,10 +105,20 @@ jobs:
           img="ghcr.io/${GHCR_NS}/${IMAGE_NAME}"
 
           # Live base digests - what a base/compiler SHOULD be stacked on. native + x share the
-          # busybox upstream (they differ only by the cross toolchains added on top).
-          bb_now="$(crane digest "${BUSYBOX_BASE}")"
-          wolfi_now="$(crane digest "${WOLFI_BASE}")"
-          echo "live base: BUSYBOX=$bb_now WOLFI=$wolfi_now"
+          # busybox upstream (they differ only by the cross toolchains added on top). crane digest
+          # can transiently fail on a registry flake (notably cgr.dev "Too many connections"/5xx).
+          # Retry with backoff, and DEGRADE GRACEFULLY: a flake on ONE base registry must not block
+          # the OTHER variant family - the unreachable one is skipped this run and catches up next
+          # run (everything here is level-triggered). Abort only if BOTH are unreachable.
+          digest_retry() { local d i; for i in 1 2 3 4 5; do d="$(crane digest "$1" 2>/dev/null || true)"; [ -n "$d" ] && { printf '%s' "$d"; return 0; }; sleep $((i*4)); done; return 1; }
+          bb_now="$(digest_retry "${BUSYBOX_BASE}" || true)"
+          wolfi_now="$(digest_retry "${WOLFI_BASE}" || true)"
+          bb_ok=false;    [ -n "$bb_now" ]    && bb_ok=true    || true
+          wolfi_ok=false; [ -n "$wolfi_now" ] && wolfi_ok=true || true
+          echo "live base: BUSYBOX=${bb_now:-<unreachable>} (ok=$bb_ok)  WOLFI=${wolfi_now:-<unreachable>} (ok=$wolfi_ok)"
+          [ "$bb_ok"    = true ] || echo "::warning::busybox base digest unavailable (registry flake) - skipping native + -x this run; they catch up next run"
+          [ "$wolfi_ok" = true ] || echo "::warning::wolfi base digest unavailable (cgr.dev flake) - skipping wolfi this run; it catches up next run"
+          [ "$bb_ok" = true ] || [ "$wolfi_ok" = true ] || { echo "::error::both base registries unreachable - aborting (transient; re-run)"; exit 1; }
 
           # Resolve releases.yml -> ACTIVE (base-CVE-current) + FROZEN (built once, kept).
           resolved="$(GW_CE_REPO="$GW_CE_REPO" SOURCE_REPO="$SOURCE_REPO" bash scripts/resolve-releases.sh)"
@@ -131,9 +141,9 @@ jobs:
           x_base_have="$(base_of "${img}-base-x:latest")"
           wolfi_base_have="$(base_of "${img}-base-wolfi:latest")"
           native_base_stale=false; x_base_stale=false; wolfi_base_stale=false
-          if [ "$FORCE_ALL" = "true" ] || [ "$native_base_have" != "$bb_now"    ]; then native_base_stale=true; fi
-          if [ "$FORCE_ALL" = "true" ] || [ "$x_base_have"      != "$bb_now"    ]; then x_base_stale=true;      fi
-          if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_base_have"  != "$wolfi_now" ]; then wolfi_base_stale=true;  fi
+          if [ "$bb_ok"    = true ] && { [ "$FORCE_ALL" = "true" ] || [ "$native_base_have" != "$bb_now"    ]; }; then native_base_stale=true; fi
+          if [ "$bb_ok"    = true ] && { [ "$FORCE_ALL" = "true" ] || [ "$x_base_have"      != "$bb_now"    ]; }; then x_base_stale=true;      fi
+          if [ "$wolfi_ok" = true ] && { [ "$FORCE_ALL" = "true" ] || [ "$wolfi_base_have"  != "$wolfi_now" ]; }; then wolfi_base_stale=true;  fi
           bv=""
           [ "$native_base_stale" = true ] && bv="$bv native"
           [ "$x_base_stale"      = true ] && bv="$bv x"
@@ -152,24 +162,28 @@ jobs:
           for v in $active; do
             cfg="$(crane config "${img}:${v}" 2>/dev/null || echo '{}')"
             native_have="$(echo "$cfg" | jq -r '.config.Labels["io.ctp.dhi-base-digest"] // empty')"
-            if [ "$FORCE_ALL" = "true" ] || [ "$native_have" != "$bb_now" ]; then [ "$cfg" = '{}' ] && add 2 "$v" native || add 1 "$v" native; fi
+            if [ "$bb_ok" = true ] && { [ "$FORCE_ALL" = "true" ] || [ "$native_have" != "$bb_now" ]; }; then [ "$cfg" = '{}' ] && add 2 "$v" native || add 1 "$v" native; fi
             x_have="$(base_of "${img}:${v}-x")"   # -x re-stacks on the same busybox digest as native
-            if [ "$FORCE_ALL" = "true" ] || [ "$x_have" != "$bb_now" ]; then [ -z "$x_have" ] && add 2 "$v" x || add 1 "$v" x; fi
+            if [ "$bb_ok" = true ] && { [ "$FORCE_ALL" = "true" ] || [ "$x_have" != "$bb_now" ]; }; then [ -z "$x_have" ] && add 2 "$v" x || add 1 "$v" x; fi
             wolfi_have="$(base_of "${img}:${v}-wolfi")"
-            if [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; then [ -z "$wolfi_have" ] && add 2 "$v" wolfi || add 1 "$v" wolfi; fi
+            if [ "$wolfi_ok" = true ] && { [ "$FORCE_ALL" = "true" ] || [ "$wolfi_have" != "$wolfi_now" ]; }; then [ -z "$wolfi_have" ] && add 2 "$v" wolfi || add 1 "$v" wolfi; fi
             # edition/arch coverage drift (read from the existing default image) -> re-stack all variants
             [ "$cfg" = '{}' ] && continue
             for spec in "ce:tykio/tyk-gateway" "ee:tykio/tyk-gateway-ee" "fips:tykio/tyk-gateway-fips"; do
               ed="${spec%%:*}"; gw="${spec##*:}"
               live="$(live_archs "${gw}:${v}")"; have="$(echo "$cfg" | jq -r --arg k "io.ctp.${ed}-archs" '.config.Labels[$k] // ""')"
-              if [ "$live" != "$have" ]; then echo "-> $v: $ed arch drift ('${have}' -> '${live}')"; add 1 "$v" native; add 1 "$v" x; add 1 "$v" wolfi; fi
+              if [ "$live" != "$have" ]; then
+                echo "-> $v: $ed arch drift ('${have}' -> '${live}')"
+                if [ "$bb_ok"    = true ]; then add 1 "$v" native; add 1 "$v" x; fi
+                if [ "$wolfi_ok" = true ]; then add 1 "$v" wolfi; fi
+              fi
             done
           done
           # FROZEN: build once if the image is missing (backfill); never re-stacked on a base change.
           for v in $frozen; do
-            crane manifest "${img}:${v}"       >/dev/null 2>&1 || { echo "-> $v: no native image (frozen)"; add 2 "$v" native; }
-            crane manifest "${img}:${v}-x"     >/dev/null 2>&1 || { echo "-> $v: no -x image (frozen)";     add 2 "$v" x; }
-            crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1 || { echo "-> $v: no Wolfi image (frozen)";  add 2 "$v" wolfi; }
+            if [ "$bb_ok"    = true ] && ! crane manifest "${img}:${v}"       >/dev/null 2>&1; then echo "-> $v: no native image (frozen)"; add 2 "$v" native; fi
+            if [ "$bb_ok"    = true ] && ! crane manifest "${img}:${v}-x"     >/dev/null 2>&1; then echo "-> $v: no -x image (frozen)";     add 2 "$v" x; fi
+            if [ "$wolfi_ok" = true ] && ! crane manifest "${img}:${v}-wolfi" >/dev/null 2>&1; then echo "-> $v: no Wolfi image (frozen)";  add 2 "$v" wolfi; fi
           done
 
           # Order: re-stacks (tier 1) before backfills (tier 2), oldest-first within each tier.
