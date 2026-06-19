@@ -275,11 +275,22 @@ jobs:
           # never overwriting the 2.17 default (:v5.13.0-wolfi). Empty for 2.17.
           # index:* annotations populate the GHCR package description + repo link for the
           # multi-arch index (a per-arch LABEL does not propagate to the index).
-          docker buildx imagetools create \
-            --annotation "index:org.opencontainers.image.title=compile-tyk-plugin" \
-            --annotation "index:org.opencontainers.image.description=Community/unofficial modern low-CVE compiler for Tyk Go plugins (Wolfi base, glibc-2.17 sysroot default). Not affiliated with Tyk." \
-            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --annotation "index:org.opencontainers.image.licenses=MPL-2.0" \
-            -t "${GHCR_IMG}:${TAG}-wolfi${SFX}" -t "${GHCR_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
-            -t "${DH_IMG}:${TAG}-wolfi${SFX}"   -t "${DH_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
-            "${GHCR_IMG}@${AMD}" "${GHCR_IMG}@${ARM}"
+          publish() {
+            docker buildx imagetools create \
+              --annotation "index:org.opencontainers.image.title=compile-tyk-plugin" \
+              --annotation "index:org.opencontainers.image.description=Community/unofficial modern low-CVE compiler for Tyk Go plugins (Wolfi base, glibc-2.17 sysroot default). Not affiliated with Tyk." \
+              --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+              --annotation "index:org.opencontainers.image.licenses=MPL-2.0" \
+              -t "${GHCR_IMG}:${TAG}-wolfi${SFX}" -t "${GHCR_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
+              -t "${DH_IMG}:${TAG}-wolfi${SFX}"   -t "${DH_IMG}:${TAG}-wolfi${SFX}-${DATE}" \
+              "${GHCR_IMG}@${AMD}" "${GHCR_IMG}@${ARM}"
+          }
+          # Docker Hub intermittently 400/5xx's blob uploads during imagetools' cross-registry copy
+          # (notably right after a repo was (re)created). Idempotent - already-pushed tags are
+          # skipped on retry - so retry with backoff before failing the publish.
+          for attempt in 1 2 3 4 5; do
+            if publish; then echo "published (attempt $attempt)"; exit 0; fi
+            echo "::warning::publish attempt $attempt failed (transient registry blob error?) - retrying in $((attempt*10))s"
+            sleep $((attempt*10))
+          done
+          echo "::error::publish failed after 5 attempts"; exit 1
