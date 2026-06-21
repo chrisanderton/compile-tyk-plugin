@@ -189,7 +189,10 @@ jobs:
           # Order: re-stacks (tier 1) before backfills (tier 2), oldest-first within each tier.
           # The cap is MANUAL-ONLY and a GLOBAL TOTAL: applied only when a positive max_dispatch was
           # supplied. Scheduled runs (and manual runs with no value) dispatch everything needed.
-          ranked="$(printf '%s\n' "$cand" | grep -E '^[12] v' | sort -u | sort -k1,1n -k2,2V)"
+          # || true: when NOTHING needs building (all images current, no drift) $cand is empty and
+          # grep matches nothing -> exit 1 -> under set -euo pipefail that would kill the whole plan
+          # job (a steady-state "nothing to do" run must be a clean no-op, not a failure).
+          ranked="$(printf '%s\n' "$cand" | grep -E '^[12] v' | sort -u | sort -k1,1n -k2,2V || true)"
           if printf '%s' "${MAX_DISPATCH:-}" | grep -qE '^[1-9][0-9]*$'; then
             ranked="$(printf '%s\n' "$ranked" | head -n "$MAX_DISPATCH")"
             echo "cap: $MAX_DISPATCH total (manual) - re-stacks first, then backfill"

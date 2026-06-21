@@ -95,7 +95,7 @@ jobs:
             if printf '%s\n' "$active" | grep -qx "$ver"; then
               [ "$date" -lt "$cutoff" ] && del_list="$del_list $t"                                      # ACTIVE: older than window
             else
-              newest="$(printf '%s\n' "$all_tags" | grep -E "^${ver}${variant}-[0-9]{8}$" | sort | tail -1)"
+              newest="$(printf '%s\n' "$all_tags" | grep -E "^${ver}${variant}-[0-9]{8}$" | sort | tail -1 || true)"
               [ "$t" != "$newest" ] && del_list="$del_list $t"                                          # FROZEN: keep newest snapshot only
             fi
           done
