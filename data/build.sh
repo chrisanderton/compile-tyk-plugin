@@ -183,19 +183,34 @@ function ensureGoMod {
 	find ./ -type f -name '*.go' -exec sed -i -e "s,\"${OLD_MODULE},\"${NEW_MODULE},g" {} \;
 }
 
-ensureGoMod
-
-# Match the plugin module's `go` directive to the Gateway's Go version. The pinned
-# toolchain IS the Gateway's Go, and GOTOOLCHAIN=local refuses a go.mod that asks for a
-# newer Go than the toolchain - so a plugin written for a newer line is clamped down to
-# build cleanly, and we can compile for OLD Gateways (e.g. v5.0.x on go1.16) without the
-# caller hand-editing go.mod. (If the plugin SOURCE genuinely uses language features newer
-# than the Gateway's Go, it correctly cannot build - that is inherent to the old target.)
+# Normalise the plugin's go.mod for THIS Gateway's (possibly old) Go toolchain BEFORE any `go`
+# command reads it (incl. ensureGoMod's `go mod edit` and the build). The plugin is compiled with
+# the Gateway's EXACT Go (plugin ABI), and GOTOOLCHAIN=local refuses a go.mod that asks for a newer
+# Go - so the directive is clamped to the Gateway's Go. The catch: a plugin authored against newer
+# Go can declare a go.mod the Gateway's toolchain cannot even PARSE - a 3-component `go 1.21.1`
+# directive or a `toolchain` directive (both Go 1.21+) make every `go` subcommand fail to READ the
+# file on older Go (e.g. go1.16 for v5.0.x: "invalid go version '1.21.1': must match format 1.23").
+# NB go1.16.15 is the TOOLCHAIN version; the go.mod `go` DIRECTIVE was major.minor-only until Go 1.21
+# - that is the field being rejected. So `go mod edit -go=` cannot self-heal (it can't read the file
+# either); rewrite the directives TEXTUALLY with sed instead. If the plugin SOURCE uses language
+# features newer than the Gateway's Go it still cannot compile - inherent to the old target, but now
+# a clear compiler error rather than a cryptic go.mod parse error.
 GW_GO_MM="$(go env GOVERSION 2>/dev/null | sed -E 's/^go([0-9]+\.[0-9]+).*/\1/')"
 if [ -n "$GW_GO_MM" ] && [ -f go.mod ]; then
-	echo "INFO: pinning plugin go directive to Gateway Go ($GW_GO_MM)"
-	go mod edit -go="$GW_GO_MM"
+	cur="$(sed -nE 's/^go[[:space:]]+([0-9][0-9.]*).*/\1/p' go.mod | head -1)"
+	echo "INFO: pinning plugin go directive to Gateway Go ($GW_GO_MM)${cur:+ (plugin declared go $cur)}"
+	if grep -qE '^go[[:space:]]+[0-9]' go.mod; then
+		sed -i -E "s/^go[[:space:]]+[0-9].*/go ${GW_GO_MM}/" go.mod
+	else
+		go mod edit -go="$GW_GO_MM"   # no go directive -> add one (file is parseable)
+	fi
+	if grep -qE '^toolchain[[:space:]]' go.mod; then
+		echo "INFO: dropping go.mod 'toolchain' directive (build uses the image's pinned Go; GOTOOLCHAIN=local)"
+		sed -i -E '/^toolchain[[:space:]]/d' go.mod
+	fi
 fi
+
+ensureGoMod
 
 # Force the plugin to build against the EXACT vendored Gateway source + dependency
 # graph - the core of Go plugin ABI compatibility. Three methods, same outcome:
