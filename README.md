@@ -86,6 +86,10 @@ Same interface as the official compiler - only the image name changes.
   `BUILD_TAG`, `GO_GET`, `GO_TIDY`, `DEBUG`, `GOFIPS140`.
 - Added: `VALIDATE=0` to skip post-build validation; `GOPROXY`/`GOSUMDB` for air-gapped
   builds (below).
+- **Go version match:** plugins are built with the **Gateway's exact Go** (a `plugin.Open` ABI
+  requirement). If your `go.mod` declares a different `go`/`toolchain` version, the build **fails
+  with guidance** rather than silently rewriting it; set `OVERRIDE_PLUGIN_GO=1` to let the compiler
+  pin the directive to the Gateway's Go (it warns on the change, extra-loudly when up-converting).
 
 Advanced sysroot settings are documented in [`docs/glibc-targets.md`](docs/glibc-targets.md).
 

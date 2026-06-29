@@ -30,7 +30,8 @@ PLUGDIR="$HERE/loadtest/test-plugin"
 archenv=(); [ -n "$ARCH" ] && archenv=(-e GOARCH="$ARCH")
 echo "== build test-plugin with $COMPILER (EDITION=$EDITION, target=${ARCH:-native}) =="
 rm -f "$PLUGDIR"/*.so
-docker run --rm -e EDITION="$EDITION" ${archenv[@]+"${archenv[@]}"} -v "$PLUGDIR:/plugin-source" "$COMPILER" plugin.so
+# OVERRIDE_PLUGIN_GO=1: our own test-plugin declares its own go directive; opt in to pinning it.
+docker run --rm -e EDITION="$EDITION" -e OVERRIDE_PLUGIN_GO=1 ${archenv[@]+"${archenv[@]}"} -v "$PLUGDIR:/plugin-source" "$COMPILER" plugin.so
 SO="$(ls "$PLUGDIR"/plugin_*_linux_*.so 2>/dev/null | head -1)"
 [ -f "$SO" ] || { echo "E2E FAIL: compiler produced no .so"; exit 1; }
 # Mount at the EXACT name the Gateway expands the apidef path to (plugin_<ver>_linux_<arch>.so),

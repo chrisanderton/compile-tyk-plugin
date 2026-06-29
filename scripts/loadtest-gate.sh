@@ -26,7 +26,10 @@ if [ -n "$GOARCH" ]; then archenv=(-e GOARCH="$GOARCH"); platform=(--platform "l
 cplat=(); [ -n "${COMPILER_PLATFORM:-}" ] && cplat=(--platform "$COMPILER_PLATFORM")
 echo "== gate: building test-plugin with $COMPILER (EDITION=$EDITION GOARCH=${GOARCH:-native} compiler=${COMPILER_PLATFORM:-native}) =="
 rm -f "$PLUGDIR"/*.so
-docker run --rm -e EDITION="$EDITION" ${archenv[@]+"${archenv[@]}"} ${cplat[@]+"${cplat[@]}"} -v "$PLUGDIR:/plugin-source" "$COMPILER" plugin.so
+# OVERRIDE_PLUGIN_GO=1: the test-plugin go.mod declares its own go directive (e.g. go 1.22) which
+# rarely equals the Gateway's exact Go; we OWN this plugin and know it's compatible, so we opt in to
+# the compiler pinning it. External users get the strict (fail-by-default) behaviour.
+docker run --rm -e EDITION="$EDITION" -e OVERRIDE_PLUGIN_GO=1 ${archenv[@]+"${archenv[@]}"} ${cplat[@]+"${cplat[@]}"} -v "$PLUGDIR:/plugin-source" "$COMPILER" plugin.so
 SO="$(ls "$PLUGDIR"/plugin_*_linux_*.so | head -1)"
 [ -f "$SO" ] || { echo "GATE FAIL: compiler produced no .so"; exit 1; }
 

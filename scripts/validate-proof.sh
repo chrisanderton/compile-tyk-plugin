@@ -29,6 +29,7 @@ export TYK_GW_PATH=/go/src/github.com/TykTechnologies/tyk
 export PLUGIN_SOURCE_PATH=/plugin-source
 export GITHUB_TAG=v5.13.0 GITHUB_SHA=1be9931a74f4e9c62844d4ae3c0cd1510b717f46
 export TYK_PLUGIN_SYSROOT_BASE=/opt/tyk/sysroots TYK_GLIBC_TARGET=$PROOF_GLIBC
+export OVERRIDE_PLUGIN_GO=1   # our proof testplugin declares its own go directive; opt in to pinning
 mkdir -p $TYK_GW_PATH $PLUGIN_SOURCE_PATH
 printf "module github.com/TykTechnologies/tyk\n\ngo 1.25\n" > $TYK_GW_PATH/go.mod   # stub gateway
 cp /src/* $PLUGIN_SOURCE_PATH/
